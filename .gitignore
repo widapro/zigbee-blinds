@@ -1,0 +1,37 @@
+# ESP-IDF build output
+build*/
+sdkconfig
+sdkconfig.old
+managed_components/
+
+# Firmware artifacts
+*.bin
+*.elf
+*.map
+*.uf2
+
+# Editor/OS
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Local project files
+.claude/
+.cache/
+CLAUDE.md
+
+# Local reference documents
+ZCL-doc_windows_covering.pdf
+
+# Credentials and local tooling
+.env
+.env.*
+*.pem
+*.key
+*.p12
+.secrets/
+.agents/
+.codex/
+__pycache__/
+node_modules/

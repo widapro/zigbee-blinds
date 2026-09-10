@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 BLE OTA Updater</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            max-width: 600px;
+            margin: 2rem auto;
+            padding: 0 1rem;
+            line-height: 1.5;
+            color: #333;
+        }
+
+        h1 {
+            color: #2c3e50;
+        }
+
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            font-size: 1rem;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.2s;
+            margin-bottom: 1rem;
+        }
+
+        button:hover {
+            background: #0056b3;
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+
+        .status {
+            margin-bottom: 1rem;
+            padding: 10px;
+            border-radius: 4px;
+            background: #f8f9fa;
+            border: 1px solid #ddd;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 20px;
+            background: #eee;
+            border-radius: 10px;
+            overflow: hidden;
+            margin-bottom: 1rem;
+            display: none;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: #28a745;
+            width: 0%;
+            transition: width 0.2s;
+        }
+
+        input[type="file"] {
+            margin-bottom: 1rem;
+            display: block;
+        }
+
+        .step {
+            margin-bottom: 2rem;
+            padding: 1.5rem;
+            border: 1px solid #eee;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.05);
+        }
+
+        .step h3 {
+            margin-top: 0;
+        }
+
+        .note {
+            font-size: 0.9rem;
+            color: #666;
+            background: #fff3cd;
+            border: 1px solid #ffeeba;
+            padding: 10px;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>ESP32 BLE OTA Updater</h1>
+
+    <div class="step">
+        <h3>Step 1: Select Firmware</h3>
+        <p>Select <code>build/zigbee_blinds.bin</code> (application image only).</p>
+        <input type="file" id="fileInput" accept=".bin">
+    </div>
+
+    <div class="step">
+        <h3>Step 2: Connect & Update</h3>
+        <p>Ensure your device is in OTA mode (triggered via Zigbee).</p>
+        <div class="note"><b>Note:</b> Use Chrome or Edge on macOS/Android/Windows.</div>
+        <br>
+        <button id="connectBtn" disabled>Connect to Device</button>
+
+        <div class="status" id="status">Waiting for file...</div>
+        <div class="progress-bar" id="progressBar">
+            <div class="progress-fill" id="progressFill"></div>
+        </div>
+        <div id="progressText" style="text-align: center; display: none;">0%</div>
+    </div>
+
+    <script>
+        const OTA_SERVICE_UUID = '8e400001-f315-4f60-9fb8-838830daea50';
+        const OTA_CONTROL_UUID = '8e400002-f315-4f60-9fb8-838830daea50';
+        const OTA_DATA_UUID = '8e400003-f315-4f60-9fb8-838830daea50';
+
+        const fileInput = document.getElementById('fileInput');
+        const connectBtn = document.getElementById('connectBtn');
+        const statusDiv = document.getElementById('status');
+        const progressBar = document.getElementById('progressBar');
+        const progressFill = document.getElementById('progressFill');
+        const progressText = document.getElementById('progressText');
+
+        let device, server, service, controlChar, dataChar;
+        let updating = false;
+        let completed = false;
+
+        const CHUNK_SIZE = 244;
+        const UI_UPDATE_INTERVAL_MS = 100;
+
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files.length > 0) {
+                connectBtn.disabled = false;
+                statusDiv.innerText = "File selected. Ready to connect.";
+            } else {
+                connectBtn.disabled = true;
+                statusDiv.innerText = "Waiting for file...";
+            }
+        });
+
+        connectBtn.addEventListener('click', async () => {
+            if (updating) return;
+            try {
+                if (!navigator.bluetooth || !window.isSecureContext) {
+                    throw new Error("Use a Web Bluetooth browser on HTTPS or localhost.");
+                }
+                if (!fileInput.files[0]) {
+                    alert("Please select a file first!");
+                    return;
+                }
+
+                updating = true;
+                completed = false;
+                connectBtn.disabled = true;
+                fileInput.disabled = true;
+                progressFill.style.width = "0%";
+                statusDiv.innerText = "Requesting Bluetooth device...";
+                device = await navigator.bluetooth.requestDevice({
+                    filters: [{ namePrefix: 'Blinds' }],
+                    optionalServices: [OTA_SERVICE_UUID]
+                });
+
+                device.addEventListener('gattserverdisconnected', onDisconnected);
+
+                statusDiv.innerText = "Connecting to GATT Server...";
+                server = await device.gatt.connect();
+
+                statusDiv.innerText = "Getting OTA Service...";
+                service = await server.getPrimaryService(OTA_SERVICE_UUID);
+
+                statusDiv.innerText = "Getting Characteristics...";
+                controlChar = await service.getCharacteristic(OTA_CONTROL_UUID);
+                dataChar = await service.getCharacteristic(OTA_DATA_UUID);
+
+                statusDiv.innerText = "Connected! Starting Update...";
+                await startUpdate();
+
+            } catch (error) {
+                console.error(error);
+                statusDiv.innerText = "Error: " + error.message;
+            } finally {
+                if (device?.gatt.connected) device.gatt.disconnect();
+                updating = false;
+                fileInput.disabled = false;
+                connectBtn.disabled = !fileInput.files.length;
+            }
+        });
+
+        function onDisconnected() {
+            if (!updating && !completed) {
+                statusDiv.innerText = "Device disconnected. Reconnect to restart the upload.";
+            }
+        }
+
+        async function writeWithResponse(characteristic, value) {
+            if (characteristic.writeValueWithResponse) {
+                await characteristic.writeValueWithResponse(value);
+                return;
+            }
+            await characteristic.writeValue(value);
+        }
+
+        async function startUpdate() {
+            const file = fileInput.files[0];
+            const buffer = await file.arrayBuffer();
+            const totalBytes = buffer.byteLength;
+            if (totalBytes === 0 || totalBytes > 0x180000 || new Uint8Array(buffer)[0] !== 0xE9) {
+                throw new Error("Select an ESP application image no larger than 1.5 MiB.");
+            }
+
+            // Start OTA
+            statusDiv.innerText = "Sending Start Command...";
+            await writeWithResponse(controlChar, new Uint8Array([0])); // 0 = Start
+
+            statusDiv.innerText = "Uploading Firmware...";
+            progressBar.style.display = 'block';
+            progressText.style.display = 'block';
+
+            let offset = 0;
+            let lastUiUpdate = 0;
+            const startedAt = performance.now();
+            statusDiv.innerText = "Uploading Firmware...";
+
+            while (offset < totalBytes) {
+                const length = Math.min(CHUNK_SIZE, totalBytes - offset);
+                const chunk = new Uint8Array(buffer, offset, length);
+
+                // Acknowledge every chunk: failed flash writes must stop the upload.
+                // Never retry an ambiguous write; the protocol has no sequence numbers.
+                await writeWithResponse(dataChar, chunk);
+
+                offset += length;
+                const percent = Math.floor((offset / totalBytes) * 100);
+                const now = performance.now();
+
+                if (now - lastUiUpdate >= UI_UPDATE_INTERVAL_MS || offset >= totalBytes) {
+                    const elapsedSeconds = Math.max((now - startedAt) / 1000, 0.001);
+                    const speedKb = (offset / 1024 / elapsedSeconds).toFixed(1);
+                    progressFill.style.width = percent + '%';
+                    progressText.innerText = percent + '%';
+                    statusDiv.innerText = `Uploading... ${percent}% (${offset}/${totalBytes} bytes, ${speedKb} KB/s)`;
+                    lastUiUpdate = now;
+                }
+            }
+
+            // End OTA
+            statusDiv.innerText = "Sending End Command...";
+            await writeWithResponse(controlChar, new Uint8Array([1])); // 1 = End
+
+            completed = true;
+            statusDiv.innerText = "Image accepted. Check that the device rejoins Zigbee after reboot.";
+            progressFill.style.background = '#28a745';
+        }
+    </script>
+</body>
+
+</html>
