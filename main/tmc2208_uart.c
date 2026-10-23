@@ -94,6 +94,7 @@ static esp_err_t tmc2208_write_register(tmc2208_uart_t *driver, uint8_t reg,
   if (ret != ESP_OK) {
     return ret;
   }
+  driver->last_register = reg;
 
   uint8_t datagram[8] = {
       0x05,
@@ -136,9 +137,11 @@ static esp_err_t tmc2208_read_register(tmc2208_uart_t *driver, uint8_t reg,
   if (ret != ESP_OK) {
     return ret;
   }
+  driver->last_register = reg;
 
   uint8_t request[4] = {0x05, 0x00, (uint8_t)(reg & 0x7F), 0};
   request[3] = tmc2208_crc8(request, sizeof(request) - 1);
+  bool saw_invalid_response = false;
 
   for (uint8_t attempt = 0; attempt < TMC2208_UART_READ_RETRIES; attempt++) {
     uart_flush_input(driver->config.uart_port);
@@ -159,36 +162,44 @@ static esp_err_t tmc2208_read_register(tmc2208_uart_t *driver, uint8_t reg,
       return ret;
     }
 
-    uart_flush_input(driver->config.uart_port);
-
     uint8_t reply[8] = {0};
-    int length = uart_read_bytes(driver->config.uart_port, reply, sizeof(reply),
-                                 TMC2208_UART_TIMEOUT_TICKS);
-    if (length != (int)sizeof(reply)) {
-      ESP_LOGW(TAG, "Register 0x%02x read timeout: %d/%u bytes", reg, length,
-               (unsigned)sizeof(reply));
-      vTaskDelay(pdMS_TO_TICKS(2));
-      continue;
+    size_t filled = 0;
+    const TickType_t started = xTaskGetTickCount();
+    // A reply can arrive while TX-wait is yielding. Do not flush RX here:
+    // scan past the single-wire request echo and assemble fragmented bytes.
+    // Noise/invalid frames do not extend the absolute per-attempt deadline.
+    while (true) {
+      const TickType_t elapsed = (TickType_t)(xTaskGetTickCount() - started);
+      if (elapsed >= TMC2208_UART_TIMEOUT_TICKS) {
+        break;
+      }
+      TickType_t remaining = TMC2208_UART_TIMEOUT_TICKS - elapsed;
+      uint8_t byte;
+      int length = uart_read_bytes(driver->config.uart_port, &byte, 1, remaining);
+      if (length < 0) return ESP_FAIL;
+      if (length != 1) {
+        break;
+      }
+      if (filled == sizeof(reply)) {
+        memmove(reply, reply + 1, sizeof(reply) - 1);
+        --filled;
+      }
+      reply[filled++] = byte;
+      if (filled == sizeof(reply) && reply[0] == 0x05 && reply[1] == 0xFF) {
+        if (reply[2] == (reg & 0x7F) &&
+            reply[7] == tmc2208_crc8(reply, sizeof(reply) - 1)) {
+          *out_value = tmc2208_decode_u32(&reply[3]);
+          return ESP_OK;
+        }
+        saw_invalid_response = true;
+      }
     }
-
-    uint8_t expected_crc = tmc2208_crc8(reply, sizeof(reply) - 1);
-    if (reply[0] != 0x05 || reply[1] != 0xFF || reply[2] != (reg & 0x7F)) {
-      ESP_LOGW(TAG, "Register 0x%02x reply header invalid", reg);
-      ESP_LOG_BUFFER_HEX_LEVEL(TAG, reply, sizeof(reply), ESP_LOG_DEBUG);
-      continue;
-    }
-
-    if (reply[7] != expected_crc) {
-      ESP_LOGW(TAG, "Register 0x%02x CRC invalid: got=0x%02x expected=0x%02x",
-               reg, reply[7], expected_crc);
-      continue;
-    }
-
-    *out_value = tmc2208_decode_u32(&reply[3]);
-    return ESP_OK;
+    ESP_LOGW(TAG, "Register 0x%02x: no valid UART reply (attempt %u)",
+             reg, (unsigned)attempt + 1);
+    vTaskDelay(pdMS_TO_TICKS(2));
   }
 
-  return ESP_FAIL;
+  return saw_invalid_response ? ESP_ERR_INVALID_RESPONSE : ESP_ERR_TIMEOUT;
 }
 
 static esp_err_t tmc2208_write_register_checked(tmc2208_uart_t *driver,
@@ -243,6 +254,7 @@ esp_err_t tmc2208_uart_init(tmc2208_uart_t *driver,
 
   memset(driver, 0, sizeof(*driver));
   driver->config = *config;
+  driver->last_register = 0xFF;
 
   gpio_reset_pin(config->rx_pin);
   gpio_set_direction(config->rx_pin, GPIO_MODE_INPUT);

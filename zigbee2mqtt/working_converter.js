@@ -45,9 +45,17 @@ const crashStageLookup = {
     22: 'zigbee_device_register',
     23: 'zigbee_start',
     24: 'zigbee_running',
+    25: 'zigbee_command_decode',
+    26: 'zigbee_command_enqueue',
     30: 'motor_worker',
     31: 'motor_move',
     32: 'calibration',
+    33: 'motor_command_take',
+    34: 'motor_report',
+    35: 'motor_execute',
+    36: 'motor_store',
+    37: 'motor_state_sync',
+    38: 'motor_tilt_report',
     40: 'ble_ota_write',
 };
 
@@ -77,6 +85,286 @@ function integerInRange(value, min, max, name) {
     return number;
 }
 
+const commandAttributes = {
+    protocol: 0xF040, request: 0xF041, result: 0xF042, target: 0xF043,
+    received: 0xF044, completed: 0xF045, failed: 0xF046, duplicates: 0xF047,
+    positionValid: 0xF048, cursor: 0xF049, boot: 0xF022,
+};
+const commandStatusLookup = {
+    0: 'idle', 1: 'accepted', 2: 'moving', 3: 'completed', 4: 'stopped',
+    5: 'superseded', 6: 'driver_error', 7: 'pulse_error', 8: 'timeout',
+    9: 'invalid', 10: 'storage_error', 11: 'position_unknown',
+};
+const tmcErrorLookup = {
+    0: 'ok', 1: 'uart_init', 2: 'gstat', 3: 'configuration', 4: 'mres_write',
+    5: 'mres_read', 6: 'mres_mismatch', 7: 'current_write', 8: 'not_initialized',
+    9: 'mutex_missing', 10: 'motor_busy', 11: 'uart_check',
+};
+const activeCommands = new WeakMap();
+const endpointTransactions = new WeakMap();
+const commandIds = new WeakMap();
+const commandIoOptions = {timeout: 5000, disableRecovery: true, sendPolicy: 'immediate'};
+
+class SupersededCommand extends Error {}
+class DeviceCommandError extends Error {}
+
+function requireCurrent(entity, job) {
+    if (activeCommands.get(entity) !== job || job.cancelled) {
+        throw new SupersededCommand('Command replaced by a newer goal');
+    }
+}
+
+// Serializing the actual radio transactions prevents an old retry queued in
+// herdsman from being sent after a newer target or STOP from this converter.
+async function commandTransaction(entity, job, operation) {
+    const previous = endpointTransactions.get(entity) || Promise.resolve();
+    const current = previous.catch(() => {}).then(async () => {
+        requireCurrent(entity, job);
+        if (Date.now() >= job.deadline) throw new Error('Command deadline exceeded');
+        const result = await operation();
+        requireCurrent(entity, job);
+        if (Date.now() >= job.deadline) throw new Error('Command deadline exceeded');
+        return result;
+    });
+    endpointTransactions.set(entity, current);
+    return current;
+}
+
+async function commandDelay(entity, job, milliseconds) {
+    requireCurrent(entity, job);
+    await new Promise((resolve) => {
+        const timer = setTimeout(() => {job.wake = undefined; resolve();}, milliseconds);
+        job.wake = () => {clearTimeout(timer); job.wake = undefined; resolve();};
+    });
+    requireCurrent(entity, job);
+}
+
+function commandPublish(meta, payload) {
+    if (typeof meta.publish === 'function') meta.publish(payload);
+}
+
+function uint32Attribute(data, id) {
+    const value = data[id];
+    if (!Number.isInteger(value) || value < 0 || value > 0xFFFFFFFF) {
+        throw new Error(`Missing or invalid command attribute 0x${id.toString(16)}`);
+    }
+    return value;
+}
+
+function confirmedTilt(data) {
+    const value = data.currentPositionTiltPercentage ?? data[9];
+    if (!Number.isInteger(value) || value < 0 || value > 100) {
+        throw new Error('Device position is unknown or invalid');
+    }
+    return 100 - value;
+}
+
+async function readDriverFailure(entity, job, meta) {
+    // MQTT retains old diagnostics. Clear unknown fields and explicitly read
+    // current values instead of interpreting a cached 0 as a healthy driver.
+    const diagnostics = {tmc_mres_requested: null, tmc_mres_actual: null,
+        tmc_last_error: null, tmc_uart_register: null, tmc_uart_error: null,
+        motor_startup_attempts: null, motor_startup_recoveries: null};
+    const batches = [
+        {tmc_last_error: 0xF032},
+        {tmc_uart_register: 0xF036, tmc_uart_error: 0xF037},
+        {tmc_mres_requested: 0xF030, tmc_mres_actual: 0xF031},
+        {motor_startup_attempts: 0xF038, motor_startup_recoveries: 0xF039},
+    ];
+    for (const batch of batches) {
+        Object.assign(diagnostics, await readOptionalDiagnostics(entity, job, batch,
+            batch.tmc_last_error !== undefined ? 2 : 1));
+    }
+    commandPublish(meta, diagnostics);
+    const details = [];
+    if (diagnostics.motor_startup_attempts !== null) {
+        details.push(`startup_attempts=${diagnostics.motor_startup_attempts}`);
+    }
+    if (diagnostics.tmc_last_error !== null) {
+        details.push(`tmc_last_error=${diagnostics.tmc_last_error} ` +
+            `(${tmcErrorLookup[diagnostics.tmc_last_error] || 'unknown'})`);
+    }
+    if (diagnostics.tmc_uart_register !== null) {
+        details.push(`uart_register=0x${diagnostics.tmc_uart_register.toString(16)}`);
+    }
+    if (diagnostics.tmc_uart_error !== null) {
+        details.push(`uart_error=0x${diagnostics.tmc_uart_error.toString(16)}`);
+    }
+    return details.length ? ` (${details.join(', ')})` : ' (driver diagnostics unavailable)';
+}
+
+async function readOptionalDiagnostics(entity, job, attributes, attempts = 1) {
+    const diagnostics = Object.fromEntries(Object.keys(attributes).map((name) => [name, null]));
+    for (let attempt = 0; attempt < attempts; ++attempt) {
+        try {
+            const data = await commandTransaction(entity, job, () =>
+                entity.read('closuresWindowCovering', Object.values(attributes), commandIoOptions));
+            for (const [name, id] of Object.entries(attributes)) {
+                if (Number.isInteger(data[id]) && data[id] >= 0 && data[id] <= 0xFFFFFFFF) {
+                    diagnostics[name] = data[id];
+                }
+            }
+            if (Object.values(diagnostics).some((value) => value !== null)) break;
+        } catch (error) {
+            if (error instanceof SupersededCommand) throw error;
+            // Optional diagnostics must not mask the actual command failure.
+        }
+        if (attempt + 1 < attempts) await commandDelay(entity, job, 250);
+    }
+    return diagnostics;
+}
+
+async function executeReliableCommand(entity, job, meta) {
+    if (typeof entity.read !== 'function' || typeof entity.write !== 'function') {
+        throw new Error('Reliable blind commands require individual devices, not a Zigbee group');
+    }
+    commandPublish(meta, {command_status: 'sending', command_error: '',
+        ...(job.target <= 100 ? {target_tilt: 100 - job.target} : {})});
+    let initial;
+    for (let attempt = 0; attempt < 3; ++attempt) {
+        try {
+            initial = await commandTransaction(entity, job, () => entity.read('closuresWindowCovering',
+                [commandAttributes.protocol, commandAttributes.boot, commandAttributes.cursor], commandIoOptions));
+            break;
+        } catch (error) {
+            if (error instanceof SupersededCommand || attempt === 2) throw error;
+            await commandDelay(entity, job, attempt === 0 ? 2000 : 5000);
+        }
+    }
+    if (initial[commandAttributes.protocol] !== 1) {
+        throw new Error('Update the blind firmware: reliable command protocol v1 is required');
+    }
+    const boot = uint32Attribute(initial, commandAttributes.boot);
+    const cursor = uint32Attribute(initial, commandAttributes.cursor);
+    if (cursor > 0xFFFFFF) throw new Error('Invalid command cursor');
+    const previousId = commandIds.get(entity);
+    const distance = previousId === undefined ? 0 : (previousId - cursor) & 0xFFFFFF;
+    const base = distance > 0 && distance < 0x800000 ? previousId : cursor;
+    // A fresh converter session leaves a gap ahead of the device's cursor,
+    // reducing reuse of an ID from a lost in-flight packet before restart.
+    const increment = previousId === undefined ? 1 + Math.floor(Math.random() * 65535) : 1;
+    job.id = (base + increment) & 0xFFFFFF;
+    if (!job.id) job.id = 1;
+    commandIds.set(entity, job.id);
+    const request = (job.id * 256 + job.target) >>> 0;
+    let sends = 0;
+    let accepted = false;
+    let nextSendAt = 0;
+    let lastTransportError;
+    commandPublish(meta, {command_id: job.id});
+
+    while (Date.now() < job.deadline) {
+        requireCurrent(entity, job);
+        if (!accepted && sends < 3 && Date.now() >= nextSendAt) {
+            ++sends;
+            try {
+                await commandTransaction(entity, job, () => entity.write('closuresWindowCovering',
+                    {[commandAttributes.request]: {value: request, type: 0x23}}, commandIoOptions));
+            } catch (error) {
+                if (error instanceof SupersededCommand) throw error;
+                // The write response can be lost after the device accepted it.
+                // Read the correlated result before considering a retransmission.
+                lastTransportError = error;
+            }
+            nextSendAt = Date.now() + (sends === 1 ? 5000 : 10000);
+        }
+        let snapshot;
+        try {
+            snapshot = await commandTransaction(entity, job, () => entity.read('closuresWindowCovering',
+                [commandAttributes.result, commandAttributes.boot, commandAttributes.positionValid], commandIoOptions));
+        } catch (error) {
+            if (error instanceof SupersededCommand) throw error;
+            lastTransportError = error;
+        }
+        if (snapshot) {
+            const observedBoot = uint32Attribute(snapshot, commandAttributes.boot);
+            if (observedBoot !== boot) {
+                commandPublish(meta, {command_status: 'restarted', reboot_count: observedBoot});
+                throw new DeviceCommandError(`Blind restarted during the command (reboot_count ${boot} → ${observedBoot}); ` +
+                    'result is uncertain, inspect position_valid');
+            }
+            const result = uint32Attribute(snapshot, commandAttributes.result);
+            const id = result >>> 8;
+            const status = result & 0xFF;
+            if (id === job.id) {
+                accepted = true;
+                commandPublish(meta, {command_status: commandStatusLookup[status] || 'invalid', command_id: id});
+                if (status === 3 || (job.target === 101 && status === 4)) {
+                    const valid = uint32Attribute(snapshot, commandAttributes.positionValid) === 1;
+                    if (!valid && job.target !== 101) throw new Error('Blind position is not valid');
+                    const startup = await readOptionalDiagnostics(entity, job,
+                        {motor_startup_attempts: 0xF038, motor_startup_recoveries: 0xF039});
+                    if (valid) {
+                        let position;
+                        try {
+                            position = await commandTransaction(entity, job, () => entity.read('closuresWindowCovering',
+                                ['currentPositionTiltPercentage', commandAttributes.result, commandAttributes.boot], commandIoOptions));
+                        } catch (error) {
+                            if (error instanceof SupersededCommand) throw error;
+                            lastTransportError = error;
+                            await commandDelay(entity, job, 1000);
+                            continue;
+                        }
+                        const confirmedBoot = uint32Attribute(position, commandAttributes.boot);
+                        if (confirmedBoot !== boot) {
+                            commandPublish(meta, {command_status: 'restarted', reboot_count: confirmedBoot});
+                            throw new DeviceCommandError(`Blind restarted while confirming position (reboot_count ` +
+                                `${boot} → ${confirmedBoot})`);
+                        }
+                        if (uint32Attribute(position, commandAttributes.result) !== result) {
+                            throw new SupersededCommand('Device accepted another goal while confirming position');
+                        }
+                        const tilt = confirmedTilt(position);
+                        if (job.target <= 100 && tilt !== 100 - job.target) {
+                            throw new Error('Completed command does not match the confirmed position');
+                        }
+                        commandPublish(meta, {...startup, tilt, state: tilt === 0 ? 'CLOSE' : 'OPEN', position_valid: true});
+                    } else {
+                        commandPublish(meta, {...startup, position_valid: false});
+                    }
+                    return;
+                }
+                if (status !== 1 && status !== 2) {
+                    const details = status === 6 ? await readDriverFailure(entity, job, meta) : '';
+                    throw new DeviceCommandError(`Blind command failed: ${commandStatusLookup[status] || status}${details}`);
+                }
+            } else if (accepted || (id !== 0 && id !== cursor)) {
+                throw new SupersededCommand('Device accepted a different command');
+            }
+        }
+        if (!accepted && sends === 3 && Date.now() >= nextSendAt) {
+            throw new Error(`No command acceptance after 3 attempts${lastTransportError ? `: ${lastTransportError.message}` : ''}`);
+        }
+        await commandDelay(entity, job, accepted ? 3000 : 1000);
+    }
+    throw new Error('No confirmed completion before command deadline');
+}
+
+async function setReliableCommand(entity, target, meta) {
+    const previous = activeCommands.get(entity);
+    if (previous && previous.target === target && !previous.cancelled) {
+        return previous.promise;
+    }
+    if (previous) {
+        previous.cancelled = true;
+        if (previous.wake) previous.wake();
+    }
+    const timeout = integerInRange(meta.options?.command_timeout ?? 180, 15, 300, 'command_timeout');
+    const job = {target, deadline: Date.now() + timeout * 1000, cancelled: false};
+    activeCommands.set(entity, job);
+    job.promise = executeReliableCommand(entity, job, meta).catch((error) => {
+        if (error instanceof SupersededCommand) return;
+        if (activeCommands.get(entity) === job) commandPublish(meta, {
+            ...(error instanceof DeviceCommandError ? {} : {command_status: 'delivery_error'}),
+            command_error: error.message,
+        });
+        throw error;
+    }).finally(() => {
+        if (activeCommands.get(entity) === job) activeCommands.delete(entity);
+    });
+    return job.promise;
+}
+
 const definition = {
     zigbeeModel: ['esp32h2'],
     model: 'ESP32H2-WindowCovering',
@@ -85,9 +373,23 @@ const definition = {
     extend: [
         m.battery(),
     ],
+    options: [
+        exposes.numeric('command_timeout', ea.SET)
+            .withValueMin(15).withValueMax(300).withUnit('s')
+            .withDescription('Deadline for confirmed motion (default 180 seconds)'),
+    ],
     exposes: [
         // Cover entity with tilt control and open/close/stop buttons
         exposes.cover().withTilt(),
+        exposes.numeric('target_tilt', ea.STATE).withValueMin(0).withValueMax(100)
+            .withDescription('Requested tilt; confirmed position is tilt'),
+        exposes.enum('command_status', ea.STATE_GET, [...Object.values(commandStatusLookup),
+            'sending', 'delivery_error', 'restarted']).withCategory('diagnostic'),
+        exposes.numeric('command_id', ea.STATE_GET).withCategory('diagnostic'),
+        exposes.text('command_error', ea.STATE).withCategory('diagnostic'),
+        exposes.binary('position_valid', ea.STATE_GET, true, false).withCategory('diagnostic'),
+        ...['commands_received', 'commands_completed', 'commands_failed', 'command_duplicates']
+            .map((name) => exposes.numeric(name, ea.STATE_GET).withCategory('diagnostic')),
 
         // Battery voltage as separate entity
         exposes.numeric('battery_voltage', ea.STATE)
@@ -147,7 +449,19 @@ const definition = {
             .withDescription('Last verified TMC2208 MRES value (0=256 microsteps, 8=full-step, 255=unknown)')
             .withCategory('diagnostic'),
         exposes.numeric('tmc_last_error', ea.STATE_GET)
-            .withDescription('Last TMC2208 error code (0=OK, 1=UART init, 2=GSTAT, 3=config, 4=MRES write, 5=MRES read, 6=MRES mismatch)')
+            .withDescription('TMC error (0=OK, 1=UART init, 2=GSTAT, 3=config, 4=MRES write, 5=MRES read, 6=MRES mismatch, 7=current write, 8=not initialized, 9=mutex missing, 10=busy, 11=UART check)')
+            .withCategory('diagnostic'),
+        exposes.numeric('tmc_uart_register', ea.STATE_GET)
+            .withDescription('UART register at failed driver setup, decimal address (255=none)')
+            .withCategory('diagnostic'),
+        exposes.numeric('tmc_uart_error', ea.STATE_GET)
+            .withDescription('ESP setup error (0=OK, 263=no reply, 264=invalid reply, 4294967295=ESP_FAIL)')
+            .withCategory('diagnostic'),
+        exposes.numeric('motor_startup_attempts', ea.STATE_GET)
+            .withDescription('Driver startup attempts used by the latest move (0=no startup, 1=normal, 2..3=recovery)')
+            .withCategory('diagnostic'),
+        exposes.numeric('motor_startup_recoveries', ea.STATE_GET)
+            .withDescription('Driver power/UART recovery count since boot, before any motion pulses')
             .withCategory('diagnostic'),
         exposes.enum('rmt_status', ea.STATE_GET, Object.values(rmtStatusLookup))
             .withDescription('STEP pulse backend status')
@@ -167,18 +481,33 @@ const definition = {
             convert: (model, msg, publish, options, meta) => {
                 const result = {};
 
-                // Map tilt attribute so HA tilt slider updates correctly
-                if (msg.data.hasOwnProperty('currentPositionTiltPercentage')) {
-                    const zclValue = msg.data['currentPositionTiltPercentage'];
-                    const inv = 100 - zclValue; // Z2M inverts tilt vs ZCL
-                    result.tilt = inv;
-                    result.state = inv === 0 ? 'CLOSE' : 'OPEN';
+                if (msg.data.currentPositionTiltPercentage !== undefined || msg.data[9] !== undefined) {
+                    try {
+                        const tilt = confirmedTilt(msg.data);
+                        result.tilt = tilt;
+                        result.state = tilt === 0 ? 'CLOSE' : 'OPEN';
+                    } catch { /* Ignore ZCL unknown (0xFF) and malformed positions. */ }
                 }
-                if (msg.data.hasOwnProperty(9)) { // 0x0009
-                    const zclValue = msg.data[9];
-                    const inv = 100 - zclValue;
-                    result.tilt = inv;
-                    result.state = inv === 0 ? 'CLOSE' : 'OPEN';
+                if (msg.data[commandAttributes.result] !== undefined) {
+                    const packed = msg.data[commandAttributes.result] >>> 0;
+                    result.command_id = packed >>> 8;
+                    result.command_status = commandStatusLookup[packed & 0xFF] || 'invalid';
+                    if ((packed & 0xFF) === 3 || (packed & 0xFF) === 4) result.command_error = '';
+                }
+                if (Number.isInteger(msg.data[commandAttributes.target]) &&
+                    msg.data[commandAttributes.target] >= 0 && msg.data[commandAttributes.target] <= 100) {
+                    result.target_tilt = 100 - msg.data[commandAttributes.target];
+                }
+                for (const [name, id] of Object.entries({
+                    commands_received: commandAttributes.received,
+                    commands_completed: commandAttributes.completed,
+                    commands_failed: commandAttributes.failed,
+                    command_duplicates: commandAttributes.duplicates,
+                })) {
+                    if (msg.data[id] !== undefined) result[name] = msg.data[id];
+                }
+                if (msg.data[commandAttributes.positionValid] !== undefined) {
+                    result.position_valid = msg.data[commandAttributes.positionValid] === 1;
                 }
 
                 // Handle motor_steps by ID and name (custom attribute 0xF004)
@@ -232,6 +561,18 @@ const definition = {
                 }
                 if (msg.data.hasOwnProperty(61490)) { // 0xF032
                     result.tmc_last_error = msg.data[61490];
+                }
+                if (msg.data.hasOwnProperty(61494)) { // 0xF036
+                    result.tmc_uart_register = msg.data[61494];
+                }
+                if (msg.data.hasOwnProperty(61495)) { // 0xF037
+                    result.tmc_uart_error = msg.data[61495];
+                }
+                if (msg.data.hasOwnProperty(61496)) { // 0xF038
+                    result.motor_startup_attempts = msg.data[61496];
+                }
+                if (msg.data.hasOwnProperty(61497)) { // 0xF039
+                    result.motor_startup_recoveries = msg.data[61497];
                 }
                 if (msg.data.hasOwnProperty(61491)) { // 0xF033
                     const status = msg.data[61491];
@@ -295,30 +636,33 @@ const definition = {
         },
     ],
     toZigbee: [
+        {
+            key: ['command_status', 'command_id', 'position_valid', 'commands_received',
+                'commands_completed', 'commands_failed', 'command_duplicates'],
+            convertGet: async (entity, key) => {
+                const attrs = {
+                    command_status: commandAttributes.result, command_id: commandAttributes.result,
+                    position_valid: commandAttributes.positionValid, commands_received: commandAttributes.received,
+                    commands_completed: commandAttributes.completed, commands_failed: commandAttributes.failed,
+                    command_duplicates: commandAttributes.duplicates,
+                };
+                await entity.read('closuresWindowCovering', [attrs[key]], commandIoOptions);
+            },
+        },
         // Standard ZCL window covering commands (ZHA compatible)
         {
             key: ['state', 'tilt'],
             convertSet: async (entity, key, value, meta) => {
-                if (key === 'state') {
-                    const state = typeof value === 'string' ? value.toLowerCase() : '';
-                    if (state === 'open') {
-                        await entity.command('closuresWindowCovering', 'upOpen', {}, {});
-                        return { state: { state: 'OPEN', tilt: 100 } };
-                    } else if (state === 'close') {
-                        await entity.command('closuresWindowCovering', 'downClose', {}, {});
-                        return { state: { state: 'CLOSE', tilt: 0 } };
-                    } else if (state === 'stop') {
-                        await entity.command('closuresWindowCovering', 'stop', {}, {});
-                        return { state: { state: 'STOP' } };
-                    }
-                }
-
                 if (key === 'tilt') {
                     const tilt = integerInRange(value, 0, 100, 'Tilt');
-                    const zclValue = 100 - tilt; // Z2M inverts tilt vs ZCL
-                    await entity.command('closuresWindowCovering', 'goToTiltPercentage', { percentagetiltvalue: zclValue }, {});
-                    return { state: { tilt: tilt, state: tilt === 0 ? 'CLOSE' : 'OPEN' } };
+                    await setReliableCommand(entity, 100 - tilt, meta);
+                } else {
+                    const state = typeof value === 'string' ? value.toLowerCase() : '';
+                    const targets = {open: 0, close: 100, stop: 101};
+                    if (!Object.hasOwn(targets, state)) throw new Error('State must be OPEN, CLOSE or STOP');
+                    await setReliableCommand(entity, targets[state], meta);
                 }
+                // Actual state is published only from device reports/reads.
             },
             convertGet: async (entity, key, meta) => {
                 if (key === 'tilt' || key === 'state') {
@@ -438,7 +782,7 @@ const definition = {
             },
         },
         {
-            key: ['last_reset_reason', 'restart_cause', 'reboot_count', 'last_crash_stage', 'tmc_mres_requested', 'tmc_mres_actual', 'tmc_last_error', 'rmt_status', 'rmt_fail_stage', 'rmt_last_error'],
+            key: ['last_reset_reason', 'restart_cause', 'reboot_count', 'last_crash_stage', 'tmc_mres_requested', 'tmc_mres_actual', 'tmc_last_error', 'tmc_uart_register', 'tmc_uart_error', 'motor_startup_attempts', 'motor_startup_recoveries', 'rmt_status', 'rmt_fail_stage', 'rmt_last_error'],
             convertGet: async (entity, key, meta) => {
                 const attrByKey = {
                     last_reset_reason: 0xF020,
@@ -448,6 +792,10 @@ const definition = {
                     tmc_mres_requested: 0xF030,
                     tmc_mres_actual: 0xF031,
                     tmc_last_error: 0xF032,
+                    tmc_uart_register: 0xF036,
+                    tmc_uart_error: 0xF037,
+                    motor_startup_attempts: 0xF038,
+                    motor_startup_recoveries: 0xF039,
                     rmt_status: 0xF033,
                     rmt_fail_stage: 0xF034,
                     rmt_last_error: 0xF035,
@@ -460,11 +808,17 @@ const definition = {
         const endpoint = device.getEndpoint(1);
 
         // Bind clusters so the coordinator accepts autonomous reports from the sleepy end device
+        await reporting.bind(endpoint, coordinatorEndpoint, ['closuresWindowCovering', 'genPowerCfg']);
+        await endpoint.read('closuresWindowCovering', [
+            commandAttributes.protocol, commandAttributes.result, commandAttributes.positionValid,
+        ]);
         try {
-            await reporting.bind(endpoint, coordinatorEndpoint, ['closuresWindowCovering', 'genPowerCfg']);
-            console.log('Successfully bound clusters for autonomous reporting');
+            await endpoint.read('closuresWindowCovering', [
+                commandAttributes.received, commandAttributes.completed, commandAttributes.failed,
+            ]);
+            await endpoint.read('closuresWindowCovering', [commandAttributes.duplicates]);
         } catch (error) {
-            console.log('Failed to bind clusters (device may be sleeping):', error.message);
+            console.log('Failed to read command counters:', error.message);
         }
 
         // Read motor configuration in batches of 3 attributes max
@@ -524,6 +878,16 @@ const definition = {
             ]);
         } catch (error) {
             console.log('Failed to read TMC diagnostics:', error.message);
+        }
+        try {
+            await endpoint.read('closuresWindowCovering', [0xF036, 0xF037]);
+        } catch (error) {
+            console.log('Failed to read UART failure diagnostics:', error.message);
+        }
+        try {
+            await endpoint.read('closuresWindowCovering', [0xF038, 0xF039]);
+        } catch (error) {
+            console.log('Failed to read motor startup diagnostics:', error.message);
         }
 
         try {

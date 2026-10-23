@@ -1,23 +1,7 @@
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const vm = require('node:vm');
-const path = require('node:path');
-
-// Only the host's expose builders are stubbed; execute the actual converter.
-const builder = new Proxy(function () {}, {
-    get: () => builder,
-    apply: () => builder,
-});
-const context = {
-    module: {exports: {}},
-    require: () => builder,
-    console,
-    setTimeout,
-};
-vm.runInNewContext(fs.readFileSync(path.join(__dirname,
-    '../zigbee2mqtt/working_converter.js'), 'utf8'), context);
-const definition = context.module.exports;
+const {A, loadConverter, makeBlind} = require('./converter_harness.cjs');
+const {definition} = loadConverter();
 
 for (const [key, min, max] of [
     ['tilt', 0, 100], ['motor_steps', 10, 1000],
@@ -26,28 +10,26 @@ for (const [key, min, max] of [
     const converter = definition.toZigbee.find((entry) => entry.key.includes(key));
     test(`${key}: invalid values never send Zigbee writes`, async () => {
         let writes = 0;
-        const entity = {write: async () => writes++, command: async () => writes++};
+        const entity = makeBlind({onWrite: () => writes++});
         for (const value of [NaN, Infinity, '', 'bad', '12oops', 12.5, null, true, [], min - 1, max + 1]) {
             await assert.rejects(converter.convertSet(entity, key, value, {}));
         }
         assert.equal(writes, 0);
     });
     test(`${key}: accepts bounds and numeric strings`, async () => {
-        let writes = 0;
-        const entity = {write: async () => writes++, command: async () => writes++};
+        const entity = makeBlind();
         for (const value of [min, max, String(min)]) {
             await converter.convertSet(entity, key, value, {});
         }
-        assert.equal(writes, 3);
+        assert.equal(entity.writes.length, 3);
     });
 }
 
 test('tilt maps Z2M open=100 to ZCL open=0', async () => {
     const converter = definition.toZigbee.find((entry) => entry.key.includes('tilt'));
-    let payload;
-    const entity = {command: async (cluster, command, value) => { payload = value; }};
+    const entity = makeBlind();
     await converter.convertSet(entity, 'tilt', 100, {});
-    assert.equal(payload.percentagetiltvalue, 0);
+    assert.equal(entity.writes[0].values[A.request].value & 0xFF, 0);
     await converter.convertSet(entity, 'tilt', 0, {});
-    assert.equal(payload.percentagetiltvalue, 100);
+    assert.equal(entity.writes[1].values[A.request].value & 0xFF, 100);
 });

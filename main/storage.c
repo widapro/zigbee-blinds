@@ -52,6 +52,18 @@ esp_err_t storage_load_position(uint8_t *position) {
     return ESP_OK;
   }
 
+  uint16_t motion_state;
+  err = nvs_get_u16(handle, KEY_MOTION_STATE, &motion_state);
+  if (err == ESP_OK) {
+    *position = sanitize_position((uint8_t)motion_state);
+    nvs_close(handle);
+    return ESP_OK;
+  }
+  if (err != ESP_ERR_NVS_NOT_FOUND) {
+    nvs_close(handle);
+    return err;
+  }
+
   size_t required_size = sizeof(uint8_t);
   err = nvs_get_blob(handle, KEY_POSITION, position, &required_size);
   if (err != ESP_OK) {
@@ -72,23 +84,39 @@ esp_err_t storage_load_position(uint8_t *position) {
 }
 
 esp_err_t storage_save_position(uint8_t position) {
-  position = sanitize_position(position);
+  return storage_save_motion_state(position, true);
+}
 
+esp_err_t storage_load_position_valid(bool *valid) {
+  *valid = true; // Preserve the previous estimate on upgrade from old firmware.
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open(STORAGE_NAMESPACE, NVS_READONLY, &handle);
+  if (err == ESP_ERR_NVS_NOT_FOUND) {
+    return ESP_OK;
+  }
+  if (err != ESP_OK) {
+    return err;
+  }
+  uint16_t motion_state;
+  err = nvs_get_u16(handle, KEY_MOTION_STATE, &motion_state);
+  if (err == ESP_OK) {
+    *valid = (motion_state & 0x100) != 0;
+  }
+  nvs_close(handle);
+  return err == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : err;
+}
+
+esp_err_t storage_save_motion_state(uint8_t position, bool valid) {
   nvs_handle_t handle;
   esp_err_t err = nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &handle);
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to open NVS for position save");
     return err;
   }
-
-  err = nvs_set_blob(handle, KEY_POSITION, &position, sizeof(uint8_t));
+  uint16_t motion_state = sanitize_position(position) | (valid ? 0x100 : 0);
+  err = nvs_set_u16(handle, KEY_MOTION_STATE, motion_state);
   if (err == ESP_OK) {
     err = nvs_commit(handle);
-    ESP_LOGI(TAG, "Position saved: %d%%", position);
-  } else {
-    ESP_LOGE(TAG, "Failed to save position");
   }
-
   nvs_close(handle);
   return err;
 }

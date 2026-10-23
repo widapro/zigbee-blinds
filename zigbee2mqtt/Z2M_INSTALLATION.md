@@ -4,6 +4,11 @@ This guide explains how to install the custom device template for your ESP32H2 w
 
 ## Installation
 
+Update the firmware to command protocol v1 before installing this converter.
+For existing devices, restart Zigbee2MQTT and run **Reconfigure** after updating
+both parts; pairing again is normally unnecessary. See
+[reliable commands](../docs/command-reliability.md) for the update sequence and diagnostics.
+
 1. Copy `working_converter.js` to `external_converters/` next to your
    Zigbee2MQTT `configuration.yaml` (for Docker, use the persistent data volume).
 2. Enable external JavaScript if disabled by your Zigbee2MQTT version:
@@ -140,6 +145,13 @@ To modify the template:
 | Motor Speed | Window Covering | 0xF015 | U8 | Speed setting (1-100) |
 | Reset Diagnostics | Window Covering | 0xF020-0xF023 | U8/U32 | Reset reason, restart cause, boot count, crash stage |
 | TMC/RMT Diagnostics | Window Covering | 0xF030-0xF035 | U8/U32 | Driver and step-pulse diagnostics |
+| Command Protocol | Window Covering | 0xF040 | U8 | Reliable command protocol version (1) |
+| Command Request | Window Covering | 0xF041 | U32 | Nonzero 24-bit ID and target byte (0-100, or 101 for STOP) |
+| Command Result | Window Covering | 0xF042 | U32 | Latest accepted command ID and status byte |
+| Command Target | Window Covering | 0xF043 | U8 | Latest ZCL target or 101 for STOP |
+| Command Counters | Window Covering | 0xF044-0xF047 | U32 | Received, completed/stopped, failed, duplicate/stale counts |
+| Position Valid | Window Covering | 0xF048 | U8 | 0=unknown position, 1=valid estimate |
+| Command Cursor | Window Covering | 0xF049 | U32 | Last accepted reliable 24-bit ID, reset on reboot |
 | Battery Voltage | Power Config | 0x0020 | U8 | Voltage in 100mV units |
 | Battery % | Power Config | 0x0021 | U8 | Percentage in 0.5% units |
 | Battery Voltage Precise | Power Config | 0xF100 | U16 | Voltage in 0.01V units |

@@ -70,6 +70,11 @@
             display: block;
         }
 
+        select {
+            margin: 0.5rem 0 1rem;
+            padding: 0.4rem;
+        }
+
         .step {
             margin-bottom: 2rem;
             padding: 1.5rem;
@@ -99,6 +104,7 @@
     <div class="step">
         <h3>Step 1: Select Firmware</h3>
         <p>Select <code>build/zigbee_blinds.bin</code> (application image only).</p>
+        <p>The firmware file stays in your browser and is sent directly to your device over Bluetooth. It is not uploaded to a server.</p>
         <input type="file" id="fileInput" accept=".bin">
     </div>
 
@@ -107,9 +113,17 @@
         <p>Ensure your device is in OTA mode (triggered via Zigbee).</p>
         <div class="note"><b>Note:</b> Use Chrome or Edge on macOS/Android/Windows.</div>
         <br>
+        <label for="blockPackets">Fast transfer block:</label>
+        <select id="blockPackets">
+            <option value="16">16 packets — previous setting</option>
+            <option value="32" selected>32 packets — recommended</option>
+            <option value="64">64 packets — buffered firmware, flow control</option>
+        </select>
+        <p>Start with 32 packets. Blocks of 64 use flow control; older fast firmware is limited to 32. If an upload fails, reconnect and try 16.</p>
         <button id="connectBtn" disabled>Connect to Device</button>
 
         <div class="status" id="status">Waiting for file...</div>
+        <div id="transferMode">Updater v2.6 — transfer mode shown after connection.</div>
         <div class="progress-bar" id="progressBar">
             <div class="progress-fill" id="progressFill"></div>
         </div>
@@ -124,6 +138,8 @@
         const fileInput = document.getElementById('fileInput');
         const connectBtn = document.getElementById('connectBtn');
         const statusDiv = document.getElementById('status');
+        const transferModeDiv = document.getElementById('transferMode');
+        const blockPacketsSelect = document.getElementById('blockPackets');
         const progressBar = document.getElementById('progressBar');
         const progressFill = document.getElementById('progressFill');
         const progressText = document.getElementById('progressText');
@@ -133,6 +149,9 @@
         let completed = false;
 
         const CHUNK_SIZE = 244;
+        const FAST_FLOW_WINDOW_PACKETS = 32;
+        const FAST_POLL_INTERVAL_MS = 10;
+        const FAST_ACK_TIMEOUT_MS = 15000;
         const UI_UPDATE_INTERVAL_MS = 100;
 
         fileInput.addEventListener('change', () => {
@@ -160,6 +179,7 @@
                 completed = false;
                 connectBtn.disabled = true;
                 fileInput.disabled = true;
+                blockPacketsSelect.disabled = true;
                 progressFill.style.width = "0%";
                 statusDiv.innerText = "Requesting Bluetooth device...";
                 device = await navigator.bluetooth.requestDevice({
@@ -189,6 +209,7 @@
                 if (device?.gatt.connected) device.gatt.disconnect();
                 updating = false;
                 fileInput.disabled = false;
+                blockPacketsSelect.disabled = false;
                 connectBtn.disabled = !fileInput.files.length;
             }
         });
@@ -207,6 +228,45 @@
             await characteristic.writeValue(value);
         }
 
+        function crc32(bytes) {
+            let crc = 0xFFFFFFFF;
+            for (const byte of bytes) {
+                crc ^= byte;
+                for (let bit = 0; bit < 8; bit++) {
+                    crc = (crc >>> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
+                }
+            }
+            return (crc ^ 0xFFFFFFFF) >>> 0;
+        }
+
+        async function waitForCommitted(expectedOffset, statusVersion) {
+            const deadline = performance.now() + FAST_ACK_TIMEOUT_MS;
+            let reads = 0;
+            let pollWaitMs = 0;
+            let lastCommitted = 0;
+            while (performance.now() < deadline) {
+                if (!device.gatt.connected) throw new Error("Bluetooth disconnected during upload.");
+                const status = await controlChar.readValue();
+                reads++;
+                if (status.byteLength !== 6 || status.getUint8(0) !== statusVersion) {
+                    throw new Error("Invalid OTA status from device.");
+                }
+                const committed = status.getUint32(2, true);
+                lastCommitted = committed;
+                if (status.getUint8(1) !== 0) {
+                    throw new Error(`Device failed to write firmware at byte ${committed}.`);
+                }
+                if (committed === expectedOffset) return {reads, pollWaitMs};
+                if (committed > expectedOffset) {
+                    throw new Error("Unexpected OTA offset from device.");
+                }
+                const pollStart = performance.now();
+                await new Promise(resolve => setTimeout(resolve, FAST_POLL_INTERVAL_MS));
+                pollWaitMs += performance.now() - pollStart;
+            }
+            throw new Error(`Timed out waiting for the device to write firmware (${lastCommitted}/${expectedOffset} bytes committed). Reconnect and select a smaller block.`);
+        }
+
         async function startUpdate() {
             const file = fileInput.files[0];
             const buffer = await file.arrayBuffer();
@@ -214,10 +274,57 @@
             if (totalBytes === 0 || totalBytes > 0x180000 || new Uint8Array(buffer)[0] !== 0xE9) {
                 throw new Error("Select an ESP application image no larger than 1.5 MiB.");
             }
+            let blockPackets = Number(blockPacketsSelect.value || 32);
+            if (![16, 32, 64].includes(blockPackets)) {
+                throw new Error("Select a block size of 16, 32 or 64 packets.");
+            }
+            let fastMode = false;
+            let statusVersion = 0;
+            let legacyReason = '';
+            const fastFirmwareAdvertised = /-F2$/.test(device.name || '');
+            const canStream = dataChar.properties?.writeWithoutResponse &&
+                typeof dataChar.writeValueWithoutResponse === 'function';
+            if (!canStream) {
+                legacyReason = 'device or browser does not support writes without response';
+            } else if (typeof controlChar.readValue !== 'function') {
+                legacyReason = 'browser cannot read OTA status';
+            } else {
+                try {
+                    const status = await controlChar.readValue();
+                    statusVersion = status.byteLength === 6 ? status.getUint8(0) : 0;
+                    fastMode = [1, 2].includes(statusVersion);
+                    if (!fastMode) legacyReason = 'device does not report fast OTA status';
+                } catch (error) {
+                    if (controlChar.properties?.read) throw error;
+                    legacyReason = `OTA status unavailable: ${error.name || 'Error'}: ${error.message}`;
+                }
+            }
+            if (fastFirmwareAdvertised && canStream && !fastMode) {
+                throw new Error(`Fast OTA device could not be verified. ${legacyReason}`);
+            }
+            const limitedByFirmware = fastMode && statusVersion === 1 && blockPackets > 32;
+            if (limitedByFirmware) blockPackets = 32;
+            const fastBlockSize = CHUNK_SIZE * blockPackets;
+            const flowControl = fastMode && statusVersion === 2 &&
+                blockPackets > FAST_FLOW_WINDOW_PACKETS;
+            const modeLabel = `Updater v2.6 — ${fastMode ? 'fast' : 'legacy'} mode` +
+                (fastMode ? `; block ${blockPackets} packets` : ` (${legacyReason})`) +
+                (fastMode && statusVersion === 2 ? '; buffered flash' : '') +
+                (flowControl ? `; flow ${FAST_FLOW_WINDOW_PACKETS} packets` : '') +
+                (limitedByFirmware ? '; 64 requires newer firmware, using 32' : '');
+            transferModeDiv.innerText = modeLabel;
 
-            // Start OTA
             statusDiv.innerText = "Sending Start Command...";
-            await writeWithResponse(controlChar, new Uint8Array([0])); // 0 = Start
+            if (fastMode) {
+                const start = new Uint8Array(9);
+                const view = new DataView(start.buffer);
+                start[0] = 2; // Checked start: size and CRC32.
+                view.setUint32(1, totalBytes, true);
+                view.setUint32(5, crc32(new Uint8Array(buffer)), true);
+                await writeWithResponse(controlChar, start);
+            } else {
+                await writeWithResponse(controlChar, new Uint8Array([0]));
+            }
 
             statusDiv.innerText = "Uploading Firmware...";
             progressBar.style.display = 'block';
@@ -225,18 +332,54 @@
 
             let offset = 0;
             let lastUiUpdate = 0;
+            let writeMs = 0;
+            let writeCount = 0;
+            let ackMs = 0;
+            let ackCount = 0;
+            let ackReads = 0;
+            let pollWaitMs = 0;
+            let flowAckMs = 0;
+            let flowAckCount = 0;
             const startedAt = performance.now();
             statusDiv.innerText = "Uploading Firmware...";
 
             while (offset < totalBytes) {
-                const length = Math.min(CHUNK_SIZE, totalBytes - offset);
-                const chunk = new Uint8Array(buffer, offset, length);
+                const blockEnd = fastMode
+                    ? Math.min(offset + fastBlockSize, totalBytes)
+                    : Math.min(offset + CHUNK_SIZE, totalBytes);
+                let packetsInBurst = 0;
+                while (offset < blockEnd) {
+                    const length = Math.min(CHUNK_SIZE, blockEnd - offset);
+                    const chunk = new Uint8Array(buffer, offset, length);
+                    const writeStart = performance.now();
+                    packetsInBurst++;
+                    const needsFlowResponse = flowControl &&
+                        packetsInBurst >= FAST_FLOW_WINDOW_PACKETS && offset + length < blockEnd;
+                    if (fastMode && !needsFlowResponse) {
+                        await dataChar.writeValueWithoutResponse(chunk);
+                    } else {
+                        // Pace intermediate bursts; the status read also drains the final burst.
+                        await writeWithResponse(dataChar, chunk);
+                    }
+                    const writeElapsed = performance.now() - writeStart;
+                    writeMs += writeElapsed;
+                    if (needsFlowResponse) {
+                        flowAckMs += writeElapsed;
+                        flowAckCount++;
+                        packetsInBurst = 0;
+                    }
+                    writeCount++;
+                    offset += length;
+                }
+                if (fastMode) {
+                    const ackStart = performance.now();
+                    const ack = await waitForCommitted(offset, statusVersion);
+                    ackMs += performance.now() - ackStart;
+                    ackCount++;
+                    ackReads += ack.reads;
+                    pollWaitMs += ack.pollWaitMs;
+                }
 
-                // Acknowledge every chunk: failed flash writes must stop the upload.
-                // Never retry an ambiguous write; the protocol has no sequence numbers.
-                await writeWithResponse(dataChar, chunk);
-
-                offset += length;
                 const percent = Math.floor((offset / totalBytes) * 100);
                 const now = performance.now();
 
@@ -245,7 +388,12 @@
                     const speedKb = (offset / 1024 / elapsedSeconds).toFixed(1);
                     progressFill.style.width = percent + '%';
                     progressText.innerText = percent + '%';
-                    statusDiv.innerText = `Uploading... ${percent}% (${offset}/${totalBytes} bytes, ${speedKb} KB/s)`;
+                    const timing = fastMode
+                        ? `write ${(writeMs / writeCount).toFixed(0)} ms/packet, ack ${(ackMs / ackCount).toFixed(0)} ms/block, reads ${(ackReads / ackCount).toFixed(1)}/block, poll wait ${(pollWaitMs / ackCount).toFixed(0)} ms/block` +
+                            (flowAckCount ? `, flow ack ${(flowAckMs / flowAckCount).toFixed(0)} ms/burst` : '')
+                        : `write ${(writeMs / writeCount).toFixed(0)} ms/packet`;
+                    statusDiv.innerText = `Uploading (${fastMode ? 'fast' : 'legacy'})... ${percent}% (${offset}/${totalBytes} bytes, ${speedKb} KB/s; ${timing})`;
+                    transferModeDiv.innerText = `${modeLabel}; ${speedKb} KB/s; ${timing}`;
                     lastUiUpdate = now;
                 }
             }

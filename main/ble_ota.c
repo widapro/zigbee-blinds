@@ -3,6 +3,7 @@
 #include "esp_system.h"
 #include "os/os_mbuf.h"
 #include "ble_ota.h"
+#include "ble_ota_transfer.h"
 #include "diagnostics.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -30,6 +31,11 @@
 #define OTA_CONN_EVENT_LEN_MAX 0
 #define OTA_DATA_LEN_OCTETS 251
 #define OTA_DATA_LEN_TIME_US 2120
+#define OTA_GATT_SCHEMA_REVISION 2
+#define OTA_FAST_START_CMD 2
+#define OTA_FAST_STATUS_VERSION 2
+#define OTA_FAST_STATUS_OK 0
+#define OTA_FAST_STATUS_WRITE_ERROR 1
 
 static const char *TAG = "BLE_OTA";
 
@@ -54,6 +60,9 @@ static esp_ota_handle_t update_handle = 0;
 static const esp_partition_t *update_partition = NULL;
 static bool update_in_progress = false;
 static bool reboot_pending = false;
+static bool fast_ota_mode = false;
+static uint8_t fast_ota_status = OTA_FAST_STATUS_OK;
+static ble_ota_transfer_t fast_transfer;
 
 // Forward declarations
 static void ble_app_advertise(void);
@@ -63,7 +72,8 @@ static int set_ota_ble_static_addr(void) {
   uint8_t addr[6];
 
   esp_read_mac(mac, ESP_MAC_IEEE802154);
-  addr[0] = mac[2] ^ 0x4f;
+  // Change the BLE identity when GATT properties change so peers rediscover them.
+  addr[0] = mac[2] ^ 0x4f ^ OTA_GATT_SCHEMA_REVISION;
   addr[1] = mac[3] ^ 0x54;
   addr[2] = mac[4] ^ 0x41;
   addr[3] = mac[5] ^ 0x32;
@@ -126,6 +136,22 @@ static void abort_update(void) {
   update_in_progress = false;
   update_handle = 0;
   update_partition = NULL;
+  ble_ota_transfer_discard(&fast_transfer);
+}
+
+static uint32_t read_le32(const uint8_t *bytes) {
+  return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+         ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+}
+
+static bool write_fast_buffer(void *context, const uint8_t *data, size_t len) {
+  (void)context;
+  esp_err_t err = esp_ota_write(update_handle, data, len);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Error writing buffered OTA data: %s", esp_err_to_name(err));
+    return false;
+  }
+  return true;
 }
 
 // Return from the GATT callback before rebooting so the final write is acknowledged.
@@ -141,6 +167,24 @@ static int device_write(uint16_t conn_handle, uint16_t attr_handle,
                         struct ble_gatt_access_ctxt *ctxt, void *arg) {
   if (reboot_pending) {
     return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+  }
+
+  if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR &&
+      ble_uuid_cmp(ctxt->chr->uuid, &ota_control_uuid.u) == 0) {
+    // Keep packet callbacks short; write the received block before acknowledging it.
+    if (fast_ota_mode && update_in_progress &&
+        !ble_ota_transfer_flush(&fast_transfer, write_fast_buffer, NULL)) {
+      fast_ota_status = OTA_FAST_STATUS_WRITE_ERROR;
+      abort_update();
+    }
+    uint8_t status[6] = {OTA_FAST_STATUS_VERSION, fast_ota_status,
+                         (uint8_t)fast_transfer.committed,
+                         (uint8_t)(fast_transfer.committed >> 8),
+                         (uint8_t)(fast_transfer.committed >> 16),
+                         (uint8_t)(fast_transfer.committed >> 24)};
+    return os_mbuf_append(ctxt->om, status, sizeof(status)) == 0
+               ? 0
+               : BLE_ATT_ERR_INSUFFICIENT_RES;
   }
 
   // NimBLE can split one ATT value across several mbufs.
@@ -159,8 +203,21 @@ static int device_write(uint16_t conn_handle, uint16_t attr_handle,
       return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
     }
 
-    reset_safety_timer(); // Keep alive
+    if (fast_ota_mode) {
+      uint32_t previous_received = fast_transfer.received;
+      if (!ble_ota_transfer_receive(&fast_transfer, data, len,
+                                    write_fast_buffer, NULL)) {
+        fast_ota_status = OTA_FAST_STATUS_WRITE_ERROR;
+        abort_update();
+        return BLE_ATT_ERR_UNLIKELY;
+      }
+      if (previous_received / 4096 != fast_transfer.received / 4096) {
+        reset_safety_timer();
+      }
+      return 0;
+    }
 
+    reset_safety_timer();
     esp_err_t err = esp_ota_write(update_handle, data, len);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Error writing OTA data: %s", esp_err_to_name(err));
@@ -172,28 +229,42 @@ static int device_write(uint16_t conn_handle, uint16_t attr_handle,
 
   // Control Characteristic (Start/End)
   if (ble_uuid_cmp(ctxt->chr->uuid, &ota_control_uuid.u) == 0) {
-    if (len != 1)
+    if ((len != 1 && len != 9) || (len == 9 && data[0] != OTA_FAST_START_CMD))
       return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
 
     uint8_t cmd = data[0];
     ESP_LOGI(TAG, "Control command received: %d", cmd);
 
-    if (cmd == 0) { // Start OTA
+    if (cmd == 0 || cmd == OTA_FAST_START_CMD) { // Legacy or checked start
+      if ((cmd == 0 && len != 1) || (cmd == OTA_FAST_START_CMD && len != 9))
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
       abort_update();
+      fast_ota_mode = cmd == OTA_FAST_START_CMD;
+      fast_ota_status = OTA_FAST_STATUS_OK;
+      ble_ota_transfer_reset(&fast_transfer);
+      uint32_t image_size = fast_ota_mode ? read_le32(&data[1]) : 0;
       ESP_LOGI(TAG, "Starting OTA update...");
       update_partition = esp_ota_get_next_update_partition(NULL);
       if (update_partition == NULL) {
         ESP_LOGE(TAG, "No OTA partition found!");
         return BLE_ATT_ERR_UNLIKELY;
       }
+      if (fast_ota_mode &&
+          (image_size == 0 || image_size > update_partition->size)) {
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+      }
       ESP_LOGI(TAG, "Writing to partition subtype %d at offset 0x%lx",
                update_partition->subtype, update_partition->address);
 
-      esp_err_t err =
-          esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
+      esp_err_t err = esp_ota_begin(update_partition,
+                                    fast_ota_mode ? image_size : OTA_SIZE_UNKNOWN,
+                                    &update_handle);
       if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
         return BLE_ATT_ERR_UNLIKELY;
+      }
+      if (fast_ota_mode) {
+        ble_ota_transfer_begin(&fast_transfer, image_size, read_le32(&data[5]));
       }
       update_in_progress = true;
       reset_safety_timer();
@@ -202,6 +273,14 @@ static int device_write(uint16_t conn_handle, uint16_t attr_handle,
       ESP_LOGI(TAG, "Finishing OTA update...");
       if (!update_in_progress)
         return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+
+      if (fast_ota_mode &&
+          !ble_ota_transfer_finish(&fast_transfer, write_fast_buffer, NULL)) {
+        ESP_LOGE(TAG, "Fast OTA size, CRC or buffered flash write failed");
+        fast_ota_status = OTA_FAST_STATUS_WRITE_ERROR;
+        abort_update();
+        return BLE_ATT_ERR_UNLIKELY;
+      }
 
       esp_err_t err = esp_ota_end(update_handle);
       // esp_ota_end consumes the handle even when validation fails.
@@ -245,7 +324,7 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
              {
                  .uuid = &ota_control_uuid.u,
                  .access_cb = device_write,
-                 .flags = BLE_GATT_CHR_F_WRITE,
+                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
              },
              {
                  .uuid = &ota_data_uuid.u,
@@ -274,6 +353,9 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
   case BLE_GAP_EVENT_DISCONNECT:
     ESP_LOGI(TAG, "BLE Client Disconnected");
     abort_update();
+    fast_ota_mode = false;
+    fast_ota_status = OTA_FAST_STATUS_OK;
+    ble_ota_transfer_reset(&fast_transfer);
     // Return to advertising and let the safety timer reboot if the update was
     // abandoned.
     reset_safety_timer();
@@ -312,7 +394,9 @@ static void ble_app_advertise(void) {
   uint8_t mac[8];
   esp_read_mac(mac, ESP_MAC_IEEE802154);
   static char name[20];
-  snprintf(name, sizeof(name), "Blinds-%02X%02X", mac[6], mac[7]);
+  snprintf(name, sizeof(name), "Blinds-%02X%02X-F%d", mac[6], mac[7],
+           OTA_GATT_SCHEMA_REVISION);
+  ble_svc_gap_device_name_set(name);
 
   fields.name = (uint8_t *)name;
   fields.name_len = strlen(name);
@@ -370,6 +454,8 @@ void start_ble_ota_mode(void) {
 
   ble_hs_cfg.sync_cb = on_sync;
 
+  ble_svc_gap_init();
+  ble_svc_gatt_init();
   ble_gatts_count_cfg(gatt_svcs);
   ble_gatts_add_svcs(gatt_svcs);
 

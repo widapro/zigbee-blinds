@@ -32,5 +32,7 @@ Before a firmware release, verify pairing, full-range movement, STOP handling,
 factory reset, power-cycle recovery, battery readings and interrupted BLE OTA on
 the target hardware.
 Unit tests mock external services; they do not establish radio or motor behavior.
+The command-controller test compiles the actual C module with the host `cc`
+compiler; keep a C compiler available when running `node --test tests/*.test.cjs`.
 Do not commit `sdkconfig`, build directories, downloaded components, network
 credentials or flash dumps. Publish only the application image as an OTA artifact.

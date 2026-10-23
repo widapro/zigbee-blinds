@@ -1,0 +1,48 @@
+name: Publish BLE OTA updater
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ota.html
+      - tests/ota.test.cjs
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test OTA updater
+        run: node --test tests/ota.test.cjs
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Prepare updater site
+        run: |
+          mkdir -p "$RUNNER_TEMP/ota-pages"
+          cp ota.html "$RUNNER_TEMP/ota-pages/index.html"
+          cp ota.html "$RUNNER_TEMP/ota-pages/ota.html"
+      - name: Upload updater only
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/ota-pages
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

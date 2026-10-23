@@ -26,6 +26,10 @@ uint8_t g_motor_speed = DEFAULT_MOTOR_SPEED;
 uint8_t g_tmc_mres_requested = MOTOR_MICROSTEP_MODE;
 uint8_t g_tmc_mres_actual = 0xFF;
 uint8_t g_tmc_last_error = 0;
+uint8_t g_tmc_uart_register = 0xFF;
+uint32_t g_tmc_uart_error = ESP_OK;
+uint8_t g_motor_startup_attempts = 0;
+uint32_t g_motor_startup_recoveries = 0;
 uint8_t g_rmt_status = 0;
 uint8_t g_rmt_fail_stage = 0;
 uint32_t g_rmt_last_error = 0;
@@ -277,6 +281,12 @@ void app_main(void) {
   diagnostics_mark_stage(DIAG_STAGE_LOAD_CONFIG);
   ESP_LOGI(TAG, "Loading saved parameters...");
   ESP_ERROR_CHECK(storage_load_position(&g_current_position));
+  bool position_valid;
+  ESP_ERROR_CHECK(storage_load_position_valid(&position_valid));
+  motor_set_position_valid(position_valid);
+  if (!position_valid) {
+    ESP_LOGW(TAG, "Position unknown after interrupted motion; calibration required");
+  }
   ESP_ERROR_CHECK(storage_load_motor_steps(&g_motor_steps));
   ESP_ERROR_CHECK(storage_load_motor_mode(&g_motor_mode));
   ESP_ERROR_CHECK(storage_load_motor_irun_active(&g_motor_irun_active));

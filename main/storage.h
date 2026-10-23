@@ -12,6 +12,7 @@ extern "C" {
 // Storage keys for NVS
 #define STORAGE_NAMESPACE "blinds_cfg"
 #define KEY_POSITION "position"
+#define KEY_MOTION_STATE "motion_state"
 #define KEY_MOTOR_STEPS "motor_steps"
 #define KEY_MOTOR_MODE "motor_mode"
 #define KEY_MOTOR_IRUN_ACTIVE "motor_irun"
@@ -65,6 +66,9 @@ esp_err_t storage_load_position(uint8_t *position);
  * @return ESP_OK on success
  */
 esp_err_t storage_save_position(uint8_t position);
+// Position and validity share one NVS value so a reset cannot split them.
+esp_err_t storage_load_position_valid(bool *valid);
+esp_err_t storage_save_motion_state(uint8_t position, bool valid);
 
 /**
  * @brief Load motor steps from storage

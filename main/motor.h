@@ -51,6 +51,9 @@
 #define MOTOR_WAKE_DELAY_MS 30
 #define MOTOR_SHUTDOWN_DELAY_MS 5
 #define MOTOR_DISABLE_DELAY_MS 80
+#define MOTOR_DRIVER_RECOVERY_FIRST_DELAY_MS 250
+#define MOTOR_DRIVER_RECOVERY_SECOND_DELAY_MS 1000
+#define MOTOR_DRIVER_RECOVERY_SETTLE_MS 100
 #define MOTOR_DIR_SETTLE_US 50
 #define MOTOR_KEEP_DRIVER_READY 0
 #define MOTOR_KEEP_UART_READY 0
@@ -65,10 +68,22 @@
 #define MOTOR_POWER_MODE_SPREADCYCLE 1
 
 void motor_init(void);
-// Blocking; called by the Zigbee motor worker. False means interrupted/failed.
-bool motor_move_to_position(uint8_t target_position);
+typedef enum {
+  MOTOR_MOVE_COMPLETED = 0,
+  MOTOR_MOVE_STOPPED,
+  MOTOR_MOVE_DRIVER_ERROR,
+  MOTOR_MOVE_PULSE_ERROR,
+  MOTOR_MOVE_TIMEOUT,
+  MOTOR_MOVE_INVALID,
+} motor_move_result_t;
+// Blocking; the worker clears cancellation before publishing active work.
+motor_move_result_t motor_move_to_position(uint8_t target_position);
 void motor_stop(void);
 void motor_request_stop(void);
+void motor_clear_stop_request(void);
+bool motor_stop_requested(void);
+bool motor_position_valid(void);
+void motor_set_position_valid(bool valid);
 bool motor_is_busy(void);
 void motor_prepare_for_sleep(void);
 void motor_resume_from_sleep(void);

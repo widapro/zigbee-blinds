@@ -1,5 +1,6 @@
 #include "zb_network.h"
 #include "zb_attributes.h"
+#include "command_control.h"
 #include <inttypes.h>
 #include "battery.h"
 #include "diagnostics.h"
@@ -10,7 +11,7 @@
 #include "esp_zigbee_attribute.h"
 #include "esp_zigbee_core.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "led.h"
 #include "main.h"
@@ -18,10 +19,10 @@
 #include "nwk/esp_zigbee_nwk.h"
 #include "storage.h"
 #include "zcl/esp_zigbee_zcl_command.h"
+#include <string.h>
 
 static const char *TAG = "ZB_NETWORK";
 
-#define MOTOR_CMD_QUEUE_LEN 8
 #define POST_MOTION_AWAKE_WINDOW_MS 20000
 #define ZB_PARENT_LINK_FAILURES_BEFORE_REJOIN 3
 #define ZB_REJOIN_INITIAL_DELAY_MS 60000
@@ -44,25 +45,73 @@ static volatile bool s_ever_joined = false;
 static volatile int64_t s_last_join_state_change_us = 0;
 static bool s_health_task_started = false;
 
-typedef enum {
-  MOTOR_CMD_MOVE = 0,
-  MOTOR_CMD_STOP,
-  MOTOR_CMD_CALIBRATE,
-} motor_cmd_type_t;
+static TaskHandle_t s_motor_worker = NULL;
+static SemaphoreHandle_t s_motor_sleep_gate = NULL;
+#ifdef CONFIG_PM_ENABLE
+static esp_pm_lock_handle_t s_motor_pm_lock = NULL;
+#endif
+static command_control_t s_commands;
+static bool s_worker_busy = false;
+static bool s_report_dirty = false;
+static int64_t s_awake_until_us = 0;
+static portMUX_TYPE s_move_cmd_lock = portMUX_INITIALIZER_UNLOCKED;
 
 typedef struct {
-  motor_cmd_type_t type;
-  uint8_t endpoint;
-  uint8_t target_position; // only for MOTOR_CMD_MOVE
-} motor_cmd_t;
+  uint16_t steps;
+  uint8_t mode;
+  uint8_t irun;
+  uint8_t power_mode;
+  uint8_t speed;
+} motor_config_t;
+enum {
+  CONFIG_STEPS = 1, CONFIG_MODE = 2, CONFIG_IRUN = 4,
+  CONFIG_POWER_MODE = 8, CONFIG_SPEED = 16,
+};
+static motor_config_t s_desired_config;
+static motor_config_t s_attr_config;
+static uint8_t s_config_pending = 0;
+static bool s_ota_pending = false;
+static uint8_t s_command_protocol = COMMAND_PROTOCOL_VERSION;
+static uint32_t s_command_request = 0;
+static uint32_t s_command_result = 0;
+static uint8_t s_command_target = 0;
+static uint32_t s_command_received = 0;
+static uint32_t s_command_completed = 0;
+static uint32_t s_command_failed = 0;
+static uint32_t s_command_duplicates = 0;
+static uint32_t s_command_cursor = 0;
+static uint8_t s_position_valid = 1;
+static uint8_t s_tilt_position = 0;
 
-static QueueHandle_t s_motor_cmd_queue = NULL;
-static bool s_calibration_pending = false;
-static volatile TickType_t s_awake_until_tick = 0;
-static portMUX_TYPE s_move_cmd_lock = portMUX_INITIALIZER_UNLOCKED;
-static bool s_move_token_pending = false;
-static uint8_t s_latest_move_endpoint = ENDPOINT_ID;
-static uint8_t s_latest_move_target = 0;
+typedef struct {
+  uint16_t id;
+  const void *source;
+  void *zcl_value;
+  uint8_t size;
+} zb_backing_t;
+
+static zb_backing_t s_live_attrs[] = {
+    {ESP_ZB_ZCL_ATTR_WINDOW_COVERING_CURRENT_POSITION_TILT_PERCENTAGE_ID,
+     &s_tilt_position, NULL, sizeof(s_tilt_position)},
+    {ZB_ATTR_COMMAND_RESULT, &s_command_result, NULL, sizeof(s_command_result)},
+    {ZB_ATTR_COMMAND_TARGET, &s_command_target, NULL, sizeof(s_command_target)},
+    {ZB_ATTR_COMMAND_RECEIVED, &s_command_received, NULL, sizeof(s_command_received)},
+    {ZB_ATTR_COMMAND_COMPLETED, &s_command_completed, NULL, sizeof(s_command_completed)},
+    {ZB_ATTR_COMMAND_FAILED, &s_command_failed, NULL, sizeof(s_command_failed)},
+    {ZB_ATTR_COMMAND_DUPLICATES, &s_command_duplicates, NULL, sizeof(s_command_duplicates)},
+    {ZB_ATTR_COMMAND_CURSOR, &s_command_cursor, NULL, sizeof(s_command_cursor)},
+    {ZB_ATTR_POSITION_VALID, &s_position_valid, NULL, sizeof(s_position_valid)},
+    {ZB_ATTR_TMC_MRES_REQUESTED, &g_tmc_mres_requested, NULL, sizeof(g_tmc_mres_requested)},
+    {ZB_ATTR_TMC_MRES_ACTUAL, &g_tmc_mres_actual, NULL, sizeof(g_tmc_mres_actual)},
+    {ZB_ATTR_TMC_ERROR, &g_tmc_last_error, NULL, sizeof(g_tmc_last_error)},
+    {ZB_ATTR_TMC_UART_REGISTER, &g_tmc_uart_register, NULL, sizeof(g_tmc_uart_register)},
+    {ZB_ATTR_TMC_UART_ERROR, &g_tmc_uart_error, NULL, sizeof(g_tmc_uart_error)},
+    {ZB_ATTR_MOTOR_STARTUP_ATTEMPTS, &g_motor_startup_attempts, NULL, sizeof(g_motor_startup_attempts)},
+    {ZB_ATTR_MOTOR_STARTUP_RECOVERIES, &g_motor_startup_recoveries, NULL, sizeof(g_motor_startup_recoveries)},
+    {ZB_ATTR_RMT_STATUS, &g_rmt_status, NULL, sizeof(g_rmt_status)},
+    {ZB_ATTR_RMT_FAIL_STAGE, &g_rmt_fail_stage, NULL, sizeof(g_rmt_fail_stage)},
+    {ZB_ATTR_RMT_ERROR, &g_rmt_last_error, NULL, sizeof(g_rmt_last_error)},
+};
 
 // Forward declarations
 static void zb_check_battery_report(uint8_t param);
@@ -73,7 +122,11 @@ static void zb_report_motor_config_delayed(uint8_t param);
 static void zb_send_tilt_report(uint8_t endpoint);
 static void motor_worker_task(void *pvParameters);
 static esp_err_t enqueue_motor_command(motor_cmd_t cmd);
-static void zb_publish_tilt_position(uint8_t endpoint);
+static void zb_sync_and_optionally_report(uint8_t endpoint, bool report_tilt);
+static void zb_sync_command_attributes(void);
+static void zb_send_wc_report_attr(uint16_t attribute_id, const char *attr_name);
+static bool motor_work_pending(void);
+static void queue_motor_config(uint8_t mask);
 static uint8_t clamp_position(uint8_t position);
 static uint16_t clamp_motor_steps(uint16_t steps);
 static uint8_t sanitize_motor_mode(uint8_t mode);
@@ -149,19 +202,20 @@ static uint8_t sanitize_motor_mode(uint8_t mode) {
 }
 
 static void extend_awake_window_after_motion(void) {
-  TickType_t now = xTaskGetTickCount();
-  s_awake_until_tick = now + pdMS_TO_TICKS(POST_MOTION_AWAKE_WINDOW_MS);
+  portENTER_CRITICAL(&s_move_cmd_lock);
+  s_awake_until_us = esp_timer_get_time() + POST_MOTION_AWAKE_WINDOW_MS * 1000LL;
+  portEXIT_CRITICAL(&s_move_cmd_lock);
   ESP_LOGI(TAG, "Post-motion awake window enabled for %u ms",
            (unsigned)POST_MOTION_AWAKE_WINDOW_MS);
 }
 
 static bool awake_window_active(uint32_t *remaining_ms) {
-  TickType_t now = xTaskGetTickCount();
-  TickType_t until = s_awake_until_tick;
-  int32_t ticks_left = (int32_t)(until - now);
-  if (ticks_left > 0) {
+  portENTER_CRITICAL(&s_move_cmd_lock);
+  int64_t us_left = s_awake_until_us - esp_timer_get_time();
+  portEXIT_CRITICAL(&s_move_cmd_lock);
+  if (us_left > 0) {
     if (remaining_ms) {
-      *remaining_ms = (uint32_t)ticks_left * (uint32_t)portTICK_PERIOD_MS;
+      *remaining_ms = (uint32_t)(us_left / 1000);
     }
     return true;
   }
@@ -202,7 +256,12 @@ static void zb_rejoin_alarm_cb(uint8_t param) {
   (void)param;
   s_rejoin_alarm_scheduled = false;
   ESP_LOGW(TAG, "Attempting Zigbee network steering recovery");
-  esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+  esp_err_t err = esp_zb_bdb_start_top_level_commissioning(
+      ESP_ZB_BDB_MODE_NETWORK_STEERING);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Recovery start failed: %s", esp_err_to_name(err));
+    zb_schedule_rejoin("recovery start failed");
+  }
 }
 
 static void zb_schedule_network_steering(const char *reason, uint32_t delay_ms) {
@@ -211,8 +270,10 @@ static void zb_schedule_network_steering(const char *reason, uint32_t delay_ms) 
     return;
   }
 
+  if (network_joined || !s_last_join_state_change_us) {
+    s_last_join_state_change_us = esp_timer_get_time();
+  }
   network_joined = false;
-  s_last_join_state_change_us = esp_timer_get_time();
   s_rejoin_alarm_scheduled = true;
   ESP_LOGW(TAG, "Scheduling Zigbee rejoin in %lu ms: %s",
            (unsigned long)delay_ms, reason);
@@ -283,173 +344,281 @@ static void zb_health_monitor_task(void *pvParameters) {
   }
 }
 
+static bool motor_work_pending(void) {
+  portENTER_CRITICAL(&s_move_cmd_lock);
+  bool pending = command_control_busy(&s_commands) || s_worker_busy ||
+                 s_config_pending || s_ota_pending;
+  portEXIT_CRITICAL(&s_move_cmd_lock);
+  return pending;
+}
+
 static esp_err_t enqueue_motor_command(motor_cmd_t cmd) {
-  if (!s_motor_cmd_queue) {
-    ESP_LOGE(TAG, "Motor queue not initialized");
+  if (!s_motor_worker) {
     return ESP_ERR_INVALID_STATE;
   }
-
-  if (cmd.type == MOTOR_CMD_MOVE) {
-    bool should_enqueue_move = false;
-    uint8_t endpoint = cmd.endpoint ? cmd.endpoint : ENDPOINT_ID;
-    cmd.target_position = clamp_position(cmd.target_position);
-
-    // Preempt current motion so the new target is handled quickly.
-    if (motor_is_busy()) {
-      motor_request_stop();
-    }
-
-    portENTER_CRITICAL(&s_move_cmd_lock);
-    s_latest_move_endpoint = endpoint;
-    s_latest_move_target = cmd.target_position;
-    if (!s_move_token_pending) {
-      s_move_token_pending = true;
-      should_enqueue_move = true;
-    }
-    portEXIT_CRITICAL(&s_move_cmd_lock);
-
-    if (!should_enqueue_move) {
-      return ESP_OK;
-    }
-
-    cmd.endpoint = endpoint;
+  diagnostics_mark_stage(DIAG_STAGE_ZIGBEE_COMMAND_ENQUEUE);
+  if (!cmd.endpoint) {
+    cmd.endpoint = ENDPOINT_ID;
   }
-
-  if (xQueueSend(s_motor_cmd_queue, &cmd, 0) != pdTRUE) {
-    if (cmd.type == MOTOR_CMD_MOVE) {
-      portENTER_CRITICAL(&s_move_cmd_lock);
-      s_move_token_pending = false;
-      portEXIT_CRITICAL(&s_move_cmd_lock);
-    }
-    ESP_LOGW(TAG, "Motor queue full, dropping command type=%d", (int)cmd.type);
-    return ESP_ERR_TIMEOUT;
+  bool interrupt_active;
+  portENTER_CRITICAL(&s_move_cmd_lock);
+  command_submit_t submitted = command_control_submit(
+      &s_commands, cmd, &interrupt_active);
+  // Clear/request cancellation under the same lock used when taking work.
+  // A request received just before motor startup must not be erased there.
+  if (interrupt_active) {
+    motor_request_stop();
   }
+  s_report_dirty = true;
+  portEXIT_CRITICAL(&s_move_cmd_lock);
+  ESP_LOGI(TAG, "Command received: id=%lu type=%u target=%u disposition=%u",
+           (unsigned long)cmd.id, cmd.type, cmd.target_position, submitted);
+  if (submitted == COMMAND_SUBMIT_INVALID) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  extend_awake_window_after_motion();
+  // This function runs in a ZCL command/write callback. Updating many ZCL
+  // attributes and sending a report here re-enters the stack during its own
+  // receive path; defer all publishing until the worker owns the Zigbee lock.
+  xTaskNotifyGive(s_motor_worker);
   return ESP_OK;
 }
 
-static void zb_publish_tilt_position(uint8_t endpoint) {
-  uint8_t ep = endpoint ? endpoint : ENDPOINT_ID;
-  uint8_t position = clamp_position(g_current_position);
-  g_current_position = position;
+// Each attribute was registered with a pointer to a static value. Mirror it
+// into the stack's descriptor if registration produced a separate backing.
+// Avoid esp_zb_zcl_set_attribute_val() here: setting nine read-only/reportable
+// attributes before every move entered the SDK attribute-change path and
+// caused a panic on the device before the motor could start.
+// Called only while the Zigbee lock is held.
+static void zb_sync_command_attributes(void) {
+  portENTER_CRITICAL(&s_move_cmd_lock);
+  s_command_result = command_control_result(&s_commands);
+  s_command_target = s_commands.latest.command.type == MOTOR_CMD_STOP ?
+                     COMMAND_STOP_TARGET : s_commands.latest.command.target_position;
+  s_command_received = s_commands.received;
+  s_command_completed = s_commands.completed;
+  s_command_failed = s_commands.failed;
+  s_command_duplicates = s_commands.duplicates;
+  s_command_cursor = s_commands.reliable_cursor;
+  s_report_dirty = false;
+  portEXIT_CRITICAL(&s_move_cmd_lock);
+  s_position_valid = motor_position_valid();
+  s_tilt_position = s_position_valid ? clamp_position(g_current_position) : 0xFF;
+  for (unsigned i = 0; i < sizeof(s_live_attrs) / sizeof(s_live_attrs[0]); ++i) {
+    zb_backing_t *attr = &s_live_attrs[i];
+    if (attr->zcl_value && attr->zcl_value != attr->source) {
+      // The stack may keep its own backing rather than the pointer supplied
+      // at registration. Copy to either representation without invoking the
+      // ZCL attribute-change hook or generating automatic reports.
+      memcpy(attr->zcl_value, attr->source, attr->size);
+    }
+  }
+}
 
-  if (!esp_zb_lock_acquire(pdMS_TO_TICKS(2000))) {
-    ESP_LOGW(TAG, "Failed to acquire Zigbee lock for tilt publish");
+static void zb_sync_and_optionally_report(uint8_t endpoint, bool report_tilt) {
+  uint8_t ep = endpoint ? endpoint : ENDPOINT_ID;
+  if (!esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+    portENTER_CRITICAL(&s_move_cmd_lock);
+    s_report_dirty = true;
+    portEXIT_CRITICAL(&s_move_cmd_lock);
+    ESP_LOGW(TAG, "Zigbee publish deferred: lock unavailable");
     return;
   }
-
-  esp_err_t ret = esp_zb_zcl_set_attribute_val(
-      ep, ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-      ESP_ZB_ZCL_ATTR_WINDOW_COVERING_CURRENT_POSITION_TILT_PERCENTAGE_ID,
-      &position, false);
-  if (ret != ESP_OK) {
-    ESP_LOGW(TAG, "Failed to set tilt position attribute: %s",
-             esp_err_to_name(ret));
+  diagnostics_mark_stage(DIAG_STAGE_MOTOR_STATE_SYNC);
+  zb_sync_command_attributes();
+  // The converter reads the correlated result. Only the final tilt needs an
+  // unsolicited report for coordinators that do not use that converter.
+  if (report_tilt) {
+    diagnostics_mark_stage(DIAG_STAGE_MOTOR_TILT_REPORT);
+    zb_send_tilt_report(ep);
   }
-
-  zb_send_tilt_report(ep);
   esp_zb_lock_release();
+}
+
+static void queue_motor_config(uint8_t mask) {
+  portENTER_CRITICAL(&s_move_cmd_lock);
+  s_config_pending |= mask;
+  portEXIT_CRITICAL(&s_move_cmd_lock);
+  if (s_motor_worker) {
+    xTaskNotifyGive(s_motor_worker);
+  }
+}
+
+static esp_err_t apply_pending_motor_config(void) {
+  portENTER_CRITICAL(&s_move_cmd_lock);
+  uint8_t mask = s_config_pending;
+  motor_config_t cfg = s_desired_config;
+  s_config_pending = 0;
+  portEXIT_CRITICAL(&s_move_cmd_lock);
+  esp_err_t first_error = ESP_OK;
+#define SAVE_CONFIG(bit, global, value, save) \
+  if (mask & (bit)) { \
+    global = value; \
+    esp_err_t err = save(value); \
+    if (first_error == ESP_OK) { first_error = err; } \
+  }
+  SAVE_CONFIG(CONFIG_STEPS, g_motor_steps, cfg.steps, storage_save_motor_steps);
+  SAVE_CONFIG(CONFIG_MODE, g_motor_mode, cfg.mode, storage_save_motor_mode);
+  SAVE_CONFIG(CONFIG_IRUN, g_motor_irun_active, cfg.irun, storage_save_motor_irun_active);
+  SAVE_CONFIG(CONFIG_POWER_MODE, g_motor_power_mode, cfg.power_mode, storage_save_motor_power_mode);
+  SAVE_CONFIG(CONFIG_SPEED, g_motor_speed, cfg.speed, storage_save_motor_speed);
+#undef SAVE_CONFIG
+  if (mask & CONFIG_IRUN) {
+    motor_set_irun_active(cfg.irun);
+  }
+  if (mask & CONFIG_POWER_MODE) {
+    motor_set_power_mode(cfg.power_mode);
+  }
+  if (mask & CONFIG_SPEED) {
+    motor_set_speed(cfg.speed);
+  }
+  if (first_error != ESP_OK) {
+    ESP_LOGE(TAG, "Motor configuration could not be saved: %s",
+             esp_err_to_name(first_error));
+  }
+  return first_error;
+}
+
+static command_status_t motor_result_status(motor_move_result_t result) {
+  switch (result) {
+  case MOTOR_MOVE_COMPLETED: return COMMAND_COMPLETED;
+  case MOTOR_MOVE_STOPPED: return COMMAND_STOPPED;
+  case MOTOR_MOVE_DRIVER_ERROR: return COMMAND_DRIVER_ERROR;
+  case MOTOR_MOVE_PULSE_ERROR: return COMMAND_PULSE_ERROR;
+  case MOTOR_MOVE_TIMEOUT: return COMMAND_TIMEOUT;
+  default: return COMMAND_INVALID;
+  }
+}
+
+static command_status_t execute_motor_command(motor_cmd_t cmd) {
+  if (cmd.type == MOTOR_CMD_STOP) {
+    motor_stop();
+    return COMMAND_STOPPED;
+  }
+  if (cmd.type == MOTOR_CMD_MOVE && !motor_position_valid()) {
+    return COMMAND_POSITION_UNKNOWN;
+  }
+  bool needs_motion = cmd.type == MOTOR_CMD_CALIBRATE ||
+                      cmd.target_position != g_current_position;
+  // Mark the persisted estimate unknown before the first pulse, so an
+  // interrupted power supply cannot restore a stale position as confirmed.
+  if (needs_motion && storage_save_motion_state(g_current_position, false) != ESP_OK) {
+    return COMMAND_STORAGE_ERROR;
+  }
+  if (cmd.type == MOTOR_CMD_MOVE) {
+    diagnostics_mark_stage(DIAG_STAGE_MOTOR_MOVE);
+    return motor_result_status(motor_move_to_position(cmd.target_position));
+  }
+  diagnostics_mark_stage(DIAG_STAGE_CALIBRATION);
+  motor_set_position_valid(true);
+  g_current_position = 100; // Existing calibration assumes this starting end.
+  const uint8_t targets[] = {0, 100, 50};
+  for (unsigned i = 0; i < sizeof(targets); ++i) {
+    if (motor_stop_requested()) {
+      motor_set_position_valid(false);
+      return COMMAND_STOPPED;
+    }
+    motor_move_result_t result = motor_move_to_position(targets[i]);
+    if (result != MOTOR_MOVE_COMPLETED) {
+      motor_set_position_valid(false);
+      return motor_result_status(result);
+    }
+    if (i < 2) {
+      zb_sync_and_optionally_report(cmd.endpoint, true);
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+  }
+  return COMMAND_COMPLETED;
 }
 
 static void motor_worker_task(void *pvParameters) {
   (void)pvParameters;
-  motor_cmd_t cmd;
   diagnostics_mark_stage(DIAG_STAGE_MOTOR_WORKER);
-
   while (1) {
-    if (xQueueReceive(s_motor_cmd_queue, &cmd, portMAX_DELAY) != pdTRUE) {
+    portENTER_CRITICAL(&s_move_cmd_lock);
+    bool retry_report = s_report_dirty;
+    portEXIT_CRITICAL(&s_move_cmd_lock);
+    // Idle workers do not periodically wake the battery-powered device.
+    // A deferred attribute update gets a bounded retry instead.
+    ulTaskNotifyTake(pdTRUE, retry_report ? pdMS_TO_TICKS(1000) : portMAX_DELAY);
+    if (!motor_work_pending()) {
+      portENTER_CRITICAL(&s_move_cmd_lock);
+      bool dirty = s_report_dirty;
+      portEXIT_CRITICAL(&s_move_cmd_lock);
+      if (dirty) {
+        diagnostics_mark_stage(DIAG_STAGE_MOTOR_REPORT);
+        zb_sync_and_optionally_report(ENDPOINT_ID, false);
+        diagnostics_mark_stage(DIAG_STAGE_MOTOR_WORKER);
+      }
       continue;
     }
+    // The same mutex covers GPIO hold + explicit Zigbee sleep. The worker
+    // cannot start peripherals until the sleep callback has restored them.
+    xSemaphoreTake(s_motor_sleep_gate, portMAX_DELAY);
+    diagnostics_mark_stage(DIAG_STAGE_MOTOR_COMMAND_TAKE);
+#ifdef CONFIG_PM_ENABLE
+    esp_pm_lock_acquire(s_motor_pm_lock);
+#endif
+    portENTER_CRITICAL(&s_move_cmd_lock);
+    s_worker_busy = true;
+    portEXIT_CRITICAL(&s_move_cmd_lock);
+    apply_pending_motor_config();
 
-    uint8_t endpoint = cmd.endpoint ? cmd.endpoint : ENDPOINT_ID;
-    diagnostics_mark_stage(DIAG_STAGE_MOTOR_WORKER);
-
-    switch (cmd.type) {
-    case MOTOR_CMD_STOP:
+    portENTER_CRITICAL(&s_move_cmd_lock);
+    bool ota = s_ota_pending;
+    motor_cmd_t cmd;
+    motor_clear_stop_request();
+    bool have_command = !ota && command_control_take(&s_commands, &cmd);
+    calibration_in_progress = have_command && cmd.type == MOTOR_CMD_CALIBRATE;
+    portEXIT_CRITICAL(&s_move_cmd_lock);
+    if (ota) {
       motor_stop();
-      portENTER_CRITICAL(&s_move_cmd_lock);
-      s_move_token_pending = false;
-      s_latest_move_endpoint = endpoint;
-      s_latest_move_target = g_current_position;
-      portEXIT_CRITICAL(&s_move_cmd_lock);
-      calibration_in_progress = false;
-      extend_awake_window_after_motion();
-      break;
-    case MOTOR_CMD_MOVE: {
-      uint8_t move_endpoint = ENDPOINT_ID;
-      uint8_t move_target = g_current_position;
-
-      portENTER_CRITICAL(&s_move_cmd_lock);
-      move_endpoint = s_latest_move_endpoint;
-      move_target = s_latest_move_target;
-      s_move_token_pending = false;
-      portEXIT_CRITICAL(&s_move_cmd_lock);
-
-      calibration_in_progress = true;
-      diagnostics_mark_stage(DIAG_STAGE_MOTOR_MOVE);
-      (void)motor_move_to_position(move_target);
-      calibration_in_progress = false;
-      diagnostics_mark_stage(DIAG_STAGE_MOTOR_WORKER);
-      extend_awake_window_after_motion();
-
-      bool next_move_pending = false;
-      portENTER_CRITICAL(&s_move_cmd_lock);
-      next_move_pending = s_move_token_pending;
-      portEXIT_CRITICAL(&s_move_cmd_lock);
-
-      // Prioritize command responsiveness: if there is already a newer move
-      // queued, execute it first and publish only final position afterwards.
-      if (!next_move_pending) {
-        storage_save_position(g_current_position);
-        zb_publish_tilt_position(move_endpoint);
-      } else {
-        ESP_LOGD(TAG, "Skipping intermediate save/report, newer move pending");
-      }
-      break;
-    }
-    case MOTOR_CMD_CALIBRATE: {
-      ESP_LOGI(TAG, "*** CALIBRATION STARTED ***");
-      calibration_in_progress = true;
-      diagnostics_mark_stage(DIAG_STAGE_CALIBRATION);
-
-      g_current_position = 100;
-      bool completed = motor_move_to_position(0);
-      if (completed) {
-        zb_publish_tilt_position(endpoint);
+      if (storage_save_ota_mode(true) == ESP_OK) {
+        storage_save_pending_restart_cause(RESTART_CAUSE_OTA_MODE_TRIGGER);
         vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_restart();
       }
-
-      if (completed) {
-        completed = motor_move_to_position(100);
-        if (completed) {
-          zb_publish_tilt_position(endpoint);
-          vTaskDelay(pdMS_TO_TICKS(1000));
-        }
+      portENTER_CRITICAL(&s_move_cmd_lock);
+      s_ota_pending = false;
+      portEXIT_CRITICAL(&s_move_cmd_lock);
+      ESP_LOGE(TAG, "Cannot save OTA request");
+    } else if (have_command) {
+      ESP_LOGI(TAG, "Command started: id=%lu generation=%lu target=%u",
+               (unsigned long)cmd.id, (unsigned long)cmd.generation, cmd.target_position);
+      // Make MOVING readable without triggering an outbound report burst.
+      diagnostics_mark_stage(DIAG_STAGE_MOTOR_REPORT);
+      zb_sync_and_optionally_report(cmd.endpoint, false);
+      diagnostics_mark_stage(DIAG_STAGE_MOTOR_EXECUTE);
+      command_status_t result = execute_motor_command(cmd);
+      diagnostics_mark_stage(DIAG_STAGE_MOTOR_STORE);
+      if (storage_save_motion_state(g_current_position, motor_position_valid()) != ESP_OK) {
+        motor_set_position_valid(false);
+        result = COMMAND_STORAGE_ERROR;
       }
-
-      if (completed) {
-        completed = motor_move_to_position(50);
+      portENTER_CRITICAL(&s_move_cmd_lock);
+      if (result == COMMAND_STOPPED && s_commands.pending) {
+        result = COMMAND_SUPERSEDED;
       }
-
+      command_control_finish(&s_commands, result);
       calibration_in_progress = false;
-      s_calibration_pending = false;
-      diagnostics_mark_stage(DIAG_STAGE_MOTOR_WORKER);
-      extend_awake_window_after_motion();
-
-      storage_save_position(g_current_position);
-      zb_publish_tilt_position(endpoint);
-
-      if (completed) {
-        ESP_LOGI(TAG, "*** CALIBRATION COMPLETED - pos=%u%% ***",
-                 g_current_position);
-      } else {
-        ESP_LOGW(TAG, "*** CALIBRATION ABORTED - pos=%u%% ***",
-                 g_current_position);
-      }
-      break;
+      s_report_dirty = true;
+      portEXIT_CRITICAL(&s_move_cmd_lock);
+      ESP_LOGI(TAG, "Command finished: id=%lu result=%u position=%u valid=%u",
+               (unsigned long)cmd.id, result, g_current_position, motor_position_valid());
     }
-    default:
-      ESP_LOGW(TAG, "Unknown motor command type: %d", (int)cmd.type);
-      break;
+    extend_awake_window_after_motion();
+    diagnostics_mark_stage(DIAG_STAGE_MOTOR_REPORT);
+    zb_sync_and_optionally_report(ENDPOINT_ID, true);
+    diagnostics_mark_stage(DIAG_STAGE_MOTOR_WORKER);
+    portENTER_CRITICAL(&s_move_cmd_lock);
+    s_worker_busy = false;
+    portEXIT_CRITICAL(&s_move_cmd_lock);
+#ifdef CONFIG_PM_ENABLE
+    esp_pm_lock_release(s_motor_pm_lock);
+#endif
+    xSemaphoreGive(s_motor_sleep_gate);
+    if (motor_work_pending()) {
+      xTaskNotifyGive(s_motor_worker);
     }
   }
 }
@@ -458,8 +627,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
   uint32_t *p_sg_p = signal_struct->p_app_signal;
   esp_err_t err_status = signal_struct->esp_err_status;
   esp_zb_app_signal_type_t sig_type = *p_sg_p;
-  zb_mark_activity();
-
   switch (sig_type) {
   case ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP:
     ESP_LOGI(TAG, "Initialize Zigbee stack");
@@ -483,6 +650,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
         ESP_LOGI(TAG, "Network already joined");
         s_rejoin_delay_ms = ZB_REJOIN_INITIAL_DELAY_MS;
         s_parent_link_failure_count = 0;
+        s_rejoin_alarm_scheduled = false;
+        esp_zb_scheduler_alarm_cancel(zb_rejoin_alarm_cb, 0);
+        zb_mark_activity();
 
         // Report motor configuration values so Z2M displays them (delayed)
         esp_zb_scheduler_alarm(zb_report_motor_config_delayed, 0, 10000);
@@ -499,6 +669,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
     }
     break;
   case ESP_ZB_BDB_SIGNAL_STEERING:
+  case ESP_ZB_BDB_SIGNAL_TC_REJOIN_DONE:
     if (err_status == ESP_OK) {
       esp_zb_ieee_addr_t extended_pan_id;
       esp_zb_get_extended_pan_id(extended_pan_id);
@@ -518,6 +689,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
       s_rejoin_alarm_scheduled = false;
       s_rejoin_delay_ms = ZB_REJOIN_INITIAL_DELAY_MS;
       s_parent_link_failure_count = 0;
+      esp_zb_scheduler_alarm_cancel(zb_rejoin_alarm_cb, 0);
+      zb_mark_activity();
       ESP_LOGI(TAG, "Network joined successfully");
 
       // Report motor configuration values so Z2M displays them
@@ -582,26 +755,20 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
     break;
 #else
 
-    if (calibration_in_progress) {
+    if (motor_work_pending() || motor_is_busy() || awake_window_active(NULL)) {
       break;
-    } else if (network_joined) {
-      if (awake_window_active(NULL)) {
-        break;
-      }
-
-      s_parent_link_failure_count = 0;
-      motor_prepare_for_sleep();
-      esp_zb_sleep_now();
-      motor_resume_from_sleep();
-      zb_mark_activity();
-      // ADC handles need to be recreated after light sleep.
-      battery_mark_adc_invalid();
-    } else if (s_ever_joined && s_rejoin_alarm_scheduled) {
-      motor_prepare_for_sleep();
-      esp_zb_sleep_now();
-      motor_resume_from_sleep();
-      battery_mark_adc_invalid();
     }
+    if ((network_joined || (s_ever_joined && s_rejoin_alarm_scheduled)) &&
+        xSemaphoreTake(s_motor_sleep_gate, 0) == pdTRUE) {
+      if (!motor_work_pending()) {
+        motor_prepare_for_sleep();
+        esp_zb_sleep_now();
+        motor_resume_from_sleep();
+        battery_mark_adc_invalid();
+      }
+      xSemaphoreGive(s_motor_sleep_gate);
+    }
+
 #endif
     break;
   default:
@@ -617,6 +784,7 @@ esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                             const void *message) {
   esp_err_t ret = ESP_OK;
   zb_mark_activity();
+  s_parent_link_failure_count = 0;
   switch (callback_id) {
   case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID: {
     esp_zb_zcl_set_attr_value_message_t *set_attr_msg =
@@ -634,128 +802,82 @@ esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
             set_attr_msg->attribute.data.value != NULL,
         ESP_ERR_INVALID_ARG, TAG, "Invalid attribute write");
 
-    // Handle motor steps configuration via custom attribute 0xF004
-    if (set_attr_msg->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING &&
-        set_attr_msg->attribute.id == ZB_ATTR_MOTOR_STEPS) {
-      if (set_attr_msg->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U16) {
-        uint16_t requested_steps = *(uint16_t *)set_attr_msg->attribute.data.value;
-        uint16_t new_motor_steps = clamp_motor_steps(requested_steps);
-        if (new_motor_steps != g_motor_steps) {
-          g_motor_steps = new_motor_steps;
-          ESP_LOGI(TAG, "*** MOTOR STEPS SET TO: %d (actual=%u) ***",
-                   g_motor_steps,
-                   (unsigned int)MOTOR_STEPS_TO_ACTUAL(g_motor_steps));
-          storage_save_motor_steps(g_motor_steps);
+    if (set_attr_msg->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING) {
+      uint16_t attr = set_attr_msg->attribute.id;
+      const void *value = set_attr_msg->attribute.data.value;
+      uint8_t type = set_attr_msg->attribute.data.type;
+      uint8_t mask = 0;
+      uint16_t steps = 0;
+      uint8_t setting = 0;
+      switch (attr) {
+      case ZB_ATTR_MOTOR_STEPS:
+        ESP_RETURN_ON_FALSE(type == ESP_ZB_ZCL_ATTR_TYPE_U16, ESP_ERR_INVALID_ARG,
+                            TAG, "Invalid steps type");
+        // ZCL value buffers are byte-addressed; do not assume U16 alignment.
+        memcpy(&steps, value, sizeof(steps));
+        steps = clamp_motor_steps(steps);
+        mask = CONFIG_STEPS;
+        break;
+      case ESP_ZB_ZCL_ATTR_WINDOW_COVERING_MODE_ID:
+        ESP_RETURN_ON_FALSE(type == ESP_ZB_ZCL_ATTR_TYPE_8BITMAP, ESP_ERR_INVALID_ARG,
+                            TAG, "Invalid direction type");
+        setting = sanitize_motor_mode(*(const uint8_t *)value);
+        mask = CONFIG_MODE;
+        break;
+      case ZB_ATTR_MOTOR_IRUN:
+      case ZB_ATTR_MOTOR_POWER_MODE:
+      case ZB_ATTR_MOTOR_SPEED:
+        ESP_RETURN_ON_FALSE(type == ESP_ZB_ZCL_ATTR_TYPE_U8, ESP_ERR_INVALID_ARG,
+                            TAG, "Invalid motor setting type");
+        setting = *(const uint8_t *)value;
+        if (attr == ZB_ATTR_MOTOR_IRUN) {
+          if (setting > 31) setting = 31;
+          mask = CONFIG_IRUN;
+        } else if (attr == ZB_ATTR_MOTOR_POWER_MODE) {
+          if (setting > 1) setting = MOTOR_POWER_MODE_STEALTHCHOP;
+          mask = CONFIG_POWER_MODE;
+        } else {
+          if (setting < 1) setting = 1;
+          if (setting > 100) setting = 100;
+          mask = CONFIG_SPEED;
         }
-
-        if (new_motor_steps != requested_steps) {
-          esp_zb_zcl_set_attribute_val(set_attr_msg->info.dst_endpoint,
-                                       ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
-                                       ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ZB_ATTR_MOTOR_STEPS,
-                                       &new_motor_steps, false);
-        }
+        break;
+      case ZB_ATTR_COMMAND_REQUEST: {
+        ESP_RETURN_ON_FALSE(type == ESP_ZB_ZCL_ATTR_TYPE_U32, ESP_ERR_INVALID_ARG,
+                            TAG, "Invalid reliable command type");
+        diagnostics_mark_stage(DIAG_STAGE_ZIGBEE_COMMAND_DECODE);
+        uint32_t packed = command_control_unpack_request(value);
+        uint32_t id = packed >> 8;
+        uint8_t target = packed & 0xFF;
+        ESP_RETURN_ON_FALSE(id && target <= COMMAND_STOP_TARGET,
+                            ESP_ERR_INVALID_ARG, TAG, "Invalid reliable command");
+        motor_cmd_t cmd = {
+            .type = target == COMMAND_STOP_TARGET ? MOTOR_CMD_STOP : MOTOR_CMD_MOVE,
+            .endpoint = set_attr_msg->info.dst_endpoint,
+            .target_position = target,
+            .id = id,
+        };
+        ret = enqueue_motor_command(cmd);
+        break;
       }
-    }
-
-    // Handle motor reversal via window covering mode attribute
-    if (set_attr_msg->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING &&
-        set_attr_msg->attribute.id == ESP_ZB_ZCL_ATTR_WINDOW_COVERING_MODE_ID) {
-      if (set_attr_msg->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_8BITMAP) {
-        uint8_t requested_mode = *(uint8_t *)set_attr_msg->attribute.data.value;
-        uint8_t new_mode = sanitize_motor_mode(requested_mode);
-        if (new_mode != g_motor_mode) {
-          g_motor_mode = new_mode;
-          ESP_LOGI(TAG, "*** MOTOR DIRECTION SET TO: %d (%s) ***", g_motor_mode,
-                   (g_motor_mode == 1) ? "REVERSED" : "NORMAL");
-          storage_save_motor_mode(g_motor_mode);
-        }
-
-        if (new_mode != requested_mode) {
-          esp_zb_zcl_set_attribute_val(set_attr_msg->info.dst_endpoint,
-                                       ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
-                                       ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                       ESP_ZB_ZCL_ATTR_WINDOW_COVERING_MODE_ID,
-                                       &new_mode, false);
-        }
+      default: break;
       }
-    }
-
-    // Handle motor active current (IRUN) via custom attribute 0xF012
-    if (set_attr_msg->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING &&
-        set_attr_msg->attribute.id == ZB_ATTR_MOTOR_IRUN) {
-      if (set_attr_msg->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U8) {
-        uint8_t requested_irun = *(uint8_t *)set_attr_msg->attribute.data.value;
-        uint8_t new_irun = requested_irun;
-        if (new_irun > 31) {
-          new_irun = 31;
+      if (mask) {
+        portENTER_CRITICAL(&s_move_cmd_lock);
+        switch (mask) {
+        case CONFIG_STEPS: s_desired_config.steps = steps; break;
+        case CONFIG_MODE: s_desired_config.mode = setting; break;
+        case CONFIG_IRUN: s_desired_config.irun = setting; break;
+        case CONFIG_POWER_MODE: s_desired_config.power_mode = setting; break;
+        case CONFIG_SPEED: s_desired_config.speed = setting; break;
         }
-
-        if (new_irun != g_motor_irun_active) {
-          g_motor_irun_active = new_irun;
-          ESP_LOGI(TAG, "*** MOTOR IRUN ACTIVE SET TO: %u ***",
-                   g_motor_irun_active);
-          storage_save_motor_irun_active(g_motor_irun_active);
-          motor_set_irun_active(g_motor_irun_active);
-        }
-
-        // If caller sent an out-of-range value, correct the attribute
-        // on-device.
-        if (new_irun != requested_irun) {
-          esp_zb_zcl_set_attribute_val(set_attr_msg->info.dst_endpoint,
-                                       ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
-                                       ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ZB_ATTR_MOTOR_IRUN,
-                                       &new_irun, false);
-        }
-      }
-    }
-
-    // Handle motor power mode (custom attribute 0xF014)
-    if (set_attr_msg->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING &&
-        set_attr_msg->attribute.id == ZB_ATTR_MOTOR_POWER_MODE) {
-      if (set_attr_msg->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U8) {
-        uint8_t requested_mode = *(uint8_t *)set_attr_msg->attribute.data.value;
-        uint8_t new_mode = requested_mode > 1 ? 0 : requested_mode;
-
-        if (new_mode != g_motor_power_mode) {
-          g_motor_power_mode = new_mode;
-          ESP_LOGI(TAG, "*** MOTOR POWER MODE SET TO: %u (%s) ***",
-                   g_motor_power_mode,
-                   g_motor_power_mode ? "SpreadCycle" : "StealthChop");
-          storage_save_motor_power_mode(g_motor_power_mode);
-          motor_set_power_mode(g_motor_power_mode);
-        }
-
-        if (new_mode != requested_mode) {
-          esp_zb_zcl_set_attribute_val(set_attr_msg->info.dst_endpoint,
-                                       ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
-                                       ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ZB_ATTR_MOTOR_POWER_MODE,
-                                       &new_mode, false);
-        }
-      }
-    }
-
-    // Handle motor speed (custom attribute 0xF015)
-    if (set_attr_msg->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING &&
-        set_attr_msg->attribute.id == ZB_ATTR_MOTOR_SPEED) {
-      if (set_attr_msg->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U8) {
-        uint8_t requested_speed = *(uint8_t *)set_attr_msg->attribute.data.value;
-        uint8_t new_speed = requested_speed;
-        if (new_speed < 1) new_speed = 1;
-        if (new_speed > 100) new_speed = 100;
-
-        if (new_speed != g_motor_speed) {
-          g_motor_speed = new_speed;
-          ESP_LOGI(TAG, "*** MOTOR SPEED SET TO: %u ***", g_motor_speed);
-          storage_save_motor_speed(g_motor_speed);
-          motor_set_speed(g_motor_speed);
-        }
-
-        if (new_speed != requested_speed) {
-          esp_zb_zcl_set_attribute_val(set_attr_msg->info.dst_endpoint,
-                                       ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
-                                       ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ZB_ATTR_MOTOR_SPEED,
-                                       &new_speed, false);
-        }
+        portEXIT_CRITICAL(&s_move_cmd_lock);
+        esp_zb_zcl_set_attribute_val(set_attr_msg->info.dst_endpoint,
+                                    ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
+                                    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, attr,
+                                    mask == CONFIG_STEPS ? (void *)&steps : (void *)&setting,
+                                    false);
+        queue_motor_config(mask);
       }
     }
 
@@ -775,18 +897,17 @@ esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                                        &reset_value, false);
 
           // Prevent sleep during calibration
-          if (calibration_in_progress || s_calibration_pending || motor_is_busy()) {
+          if (motor_work_pending() || motor_is_busy()) {
             ESP_LOGW(TAG, "Calibration request ignored (already running/pending)");
             break;
           }
 
-          s_calibration_pending = true;
           motor_cmd_t cmd = {.type = MOTOR_CMD_CALIBRATE,
                              .endpoint = set_attr_msg->info.dst_endpoint,
                              .target_position = 0};
           esp_err_t queue_ret = enqueue_motor_command(cmd);
           if (queue_ret != ESP_OK) {
-            s_calibration_pending = false;
+            ret = queue_ret;
             ESP_LOGW(TAG, "Failed to enqueue calibration command: %s",
                      esp_err_to_name(queue_ret));
           }
@@ -809,12 +930,11 @@ esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                                        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ZB_ATTR_OTA_MODE,
                                        &reset_value, false);
 
-          ESP_LOGI(TAG, "Setting OTA mode flag and rebooting...");
-          storage_save_ota_mode(true);
-          storage_save_pending_restart_cause(RESTART_CAUSE_OTA_MODE_TRIGGER);
-
-          vTaskDelay(pdMS_TO_TICKS(1000));
-          esp_restart();
+          portENTER_CRITICAL(&s_move_cmd_lock);
+          s_ota_pending = true;
+          motor_request_stop();
+          portEXIT_CRITICAL(&s_move_cmd_lock);
+          xTaskNotifyGive(s_motor_worker);
         }
       }
     }
@@ -857,15 +977,17 @@ esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
       break;
     case ESP_ZB_ZCL_CMD_WINDOW_COVERING_STOP:
       ESP_LOGI(TAG, "  Command: STOP");
-      motor_request_stop();
       cmd.type = MOTOR_CMD_STOP;
+      cmd.target_position = COMMAND_STOP_TARGET;
       should_enqueue = true;
       break;
     case ESP_ZB_ZCL_CMD_WINDOW_COVERING_GO_TO_TILT_PERCENTAGE:
       ESP_LOGI(TAG, "  Command: GO_TO_TILT_PERCENTAGE = %d%%",
                movement_msg->payload.percentage_tilt_value);
       cmd.type = MOTOR_CMD_MOVE;
-      cmd.target_position = clamp_position(movement_msg->payload.percentage_tilt_value);
+      ESP_RETURN_ON_FALSE(movement_msg->payload.percentage_tilt_value <= 100,
+                          ESP_ERR_INVALID_ARG, TAG, "Invalid tilt percentage");
+      cmd.target_position = movement_msg->payload.percentage_tilt_value;
       should_enqueue = true;
       break;
     case ESP_ZB_ZCL_CMD_WINDOW_COVERING_GO_TO_TILT_VALUE:
@@ -880,6 +1002,7 @@ esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
 
     if (should_enqueue) {
       esp_err_t queue_ret = enqueue_motor_command(cmd);
+      ret = queue_ret;
       if (queue_ret != ESP_OK) {
         ESP_LOGW(TAG, "  Failed to enqueue motor command: %s",
                  esp_err_to_name(queue_ret));
@@ -976,7 +1099,7 @@ void esp_zb_task(void *pvParameters) {
       ESP_ZB_ZCL_ATTR_WINDOW_COVERING_CURRENT_POSITION_TILT_PERCENTAGE_ID,
       ESP_ZB_ZCL_ATTR_TYPE_U8,
       ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-      &g_current_position));
+      &s_tilt_position));
 
   // Set proper installed tilt limits for correct ZCL tilt percentage math
   uint16_t installed_open_limit_tilt = 0;
@@ -997,7 +1120,7 @@ void esp_zb_task(void *pvParameters) {
       esp_zb_window_covering_cluster, ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
       ZB_ATTR_MOTOR_STEPS, ESP_ZB_ZCL_ATTR_TYPE_U16,
       ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-      &g_motor_steps));
+      &s_attr_config.steps));
 
   // Motor reversal control is handled by the existing Mode attribute
   // Bit 0 (0x01) = Reversed motor direction, already created by cluster config
@@ -1021,21 +1144,21 @@ void esp_zb_task(void *pvParameters) {
       esp_zb_window_covering_cluster, ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
       ZB_ATTR_MOTOR_IRUN, ESP_ZB_ZCL_ATTR_TYPE_U8,
       ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-      &g_motor_irun_active));
+      &s_attr_config.irun));
 
   // Add motor power mode control (custom attribute 0xF014, 0=StealthChop, 1=SpreadCycle)
   ESP_ERROR_CHECK(esp_zb_cluster_add_attr(
       esp_zb_window_covering_cluster, ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
       ZB_ATTR_MOTOR_POWER_MODE, ESP_ZB_ZCL_ATTR_TYPE_U8,
       ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-      &g_motor_power_mode));
+      &s_attr_config.power_mode));
 
   // Add motor speed control (custom attribute 0xF015, 1-100)
   ESP_ERROR_CHECK(esp_zb_cluster_add_attr(
       esp_zb_window_covering_cluster, ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
       ZB_ATTR_MOTOR_SPEED, ESP_ZB_ZCL_ATTR_TYPE_U8,
       ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-      &g_motor_speed));
+      &s_attr_config.speed));
 
   // TMC2208 diagnostics (custom attributes 0xF030-0xF032)
   ESP_ERROR_CHECK(esp_zb_cluster_add_attr(
@@ -1050,6 +1173,22 @@ void esp_zb_task(void *pvParameters) {
       esp_zb_window_covering_cluster, ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
       ZB_ATTR_TMC_ERROR, ESP_ZB_ZCL_ATTR_TYPE_U8, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
       &g_tmc_last_error));
+  ESP_ERROR_CHECK(esp_zb_cluster_add_attr(
+      esp_zb_window_covering_cluster, ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
+      ZB_ATTR_TMC_UART_REGISTER, ESP_ZB_ZCL_ATTR_TYPE_U8, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
+      &g_tmc_uart_register));
+  ESP_ERROR_CHECK(esp_zb_cluster_add_attr(
+      esp_zb_window_covering_cluster, ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
+      ZB_ATTR_TMC_UART_ERROR, ESP_ZB_ZCL_ATTR_TYPE_U32, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
+      &g_tmc_uart_error));
+  ESP_ERROR_CHECK(esp_zb_cluster_add_attr(
+      esp_zb_window_covering_cluster, ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
+      ZB_ATTR_MOTOR_STARTUP_ATTEMPTS, ESP_ZB_ZCL_ATTR_TYPE_U8, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
+      &g_motor_startup_attempts));
+  ESP_ERROR_CHECK(esp_zb_cluster_add_attr(
+      esp_zb_window_covering_cluster, ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
+      ZB_ATTR_MOTOR_STARTUP_RECOVERIES, ESP_ZB_ZCL_ATTR_TYPE_U32, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
+      &g_motor_startup_recoveries));
 
   // STEP RMT diagnostics (custom attributes 0xF033-0xF035)
   ESP_ERROR_CHECK(esp_zb_cluster_add_attr(
@@ -1093,6 +1232,29 @@ void esp_zb_task(void *pvParameters) {
       ZB_ATTR_CRASH_STAGE, ESP_ZB_ZCL_ATTR_TYPE_U8,
       ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
       &g_last_crash_stage));
+
+  struct { uint16_t id; uint8_t type; void *value; } command_attrs[] = {
+      {ZB_ATTR_COMMAND_PROTOCOL, ESP_ZB_ZCL_ATTR_TYPE_U8, &s_command_protocol},
+      {ZB_ATTR_COMMAND_RESULT, ESP_ZB_ZCL_ATTR_TYPE_U32, &s_command_result},
+      {ZB_ATTR_COMMAND_TARGET, ESP_ZB_ZCL_ATTR_TYPE_U8, &s_command_target},
+      {ZB_ATTR_COMMAND_RECEIVED, ESP_ZB_ZCL_ATTR_TYPE_U32, &s_command_received},
+      {ZB_ATTR_COMMAND_COMPLETED, ESP_ZB_ZCL_ATTR_TYPE_U32, &s_command_completed},
+      {ZB_ATTR_COMMAND_FAILED, ESP_ZB_ZCL_ATTR_TYPE_U32, &s_command_failed},
+      {ZB_ATTR_COMMAND_DUPLICATES, ESP_ZB_ZCL_ATTR_TYPE_U32, &s_command_duplicates},
+      {ZB_ATTR_COMMAND_CURSOR, ESP_ZB_ZCL_ATTR_TYPE_U32, &s_command_cursor},
+      {ZB_ATTR_POSITION_VALID, ESP_ZB_ZCL_ATTR_TYPE_U8, &s_position_valid},
+  };
+  for (unsigned i = 0; i < sizeof(command_attrs) / sizeof(command_attrs[0]); ++i) {
+    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(
+        esp_zb_window_covering_cluster, ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
+        command_attrs[i].id, command_attrs[i].type,
+        ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
+        command_attrs[i].value));
+  }
+  ESP_ERROR_CHECK(esp_zb_cluster_add_attr(
+      esp_zb_window_covering_cluster, ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
+      ZB_ATTR_COMMAND_REQUEST, ESP_ZB_ZCL_ATTR_TYPE_U32,
+      ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &s_command_request));
 
   ESP_ERROR_CHECK(esp_zb_cluster_list_add_window_covering_cluster(
       esp_zb_cluster_list, esp_zb_window_covering_cluster,
@@ -1182,11 +1344,24 @@ void esp_zb_task(void *pvParameters) {
 
   diagnostics_mark_stage(DIAG_STAGE_ZIGBEE_START);
   ESP_ERROR_CHECK(esp_zb_start(false));
+  for (unsigned i = 0; i < sizeof(s_live_attrs) / sizeof(s_live_attrs[0]); ++i) {
+    zb_backing_t *backing = &s_live_attrs[i];
+    esp_zb_zcl_attr_t *attr = esp_zb_zcl_get_attribute(
+        ENDPOINT_ID, ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, backing->id);
+    if (attr && attr->data_p) {
+      backing->zcl_value = attr->data_p;
+    } else {
+      ESP_LOGW(TAG, "Cannot locate Zigbee backing for attribute 0x%04x",
+               backing->id);
+    }
+  }
   diagnostics_mark_stage(DIAG_STAGE_ZIGBEE_RUNNING);
   esp_zb_stack_main_loop();
 }
 
 void zb_network_init(void) {
+  esp_log_level_set(TAG, ESP_LOG_INFO);
   // Initialize power management for light sleep
   ESP_ERROR_CHECK(zb_network_init_power_management());
 
@@ -1196,22 +1371,20 @@ void zb_network_init(void) {
   };
   ESP_ERROR_CHECK(esp_zb_platform_config(&config));
 
-  if (!s_motor_cmd_queue) {
-    s_motor_cmd_queue = xQueueCreate(MOTOR_CMD_QUEUE_LEN, sizeof(motor_cmd_t));
-    if (!s_motor_cmd_queue) {
-      ESP_LOGE(TAG, "Failed to create motor command queue");
-      return;
-    }
-
-    BaseType_t task_created =
-        xTaskCreate(motor_worker_task, "motor_worker", 4096, NULL, 4, NULL);
-    if (task_created != pdPASS) {
-      ESP_LOGE(TAG, "Failed to create motor worker task");
-      vQueueDelete(s_motor_cmd_queue);
-      s_motor_cmd_queue = NULL;
-      return;
-    }
-  }
+  s_desired_config = (motor_config_t){g_motor_steps, g_motor_mode,
+      g_motor_irun_active, g_motor_power_mode, g_motor_speed};
+  s_attr_config = s_desired_config;
+  s_position_valid = motor_position_valid();
+  s_tilt_position = s_position_valid ? clamp_position(g_current_position) : 0xFF;
+  s_motor_sleep_gate = xSemaphoreCreateMutex();
+  ESP_ERROR_CHECK(s_motor_sleep_gate ? ESP_OK : ESP_ERR_NO_MEM);
+#ifdef CONFIG_PM_ENABLE
+  ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "motor_work",
+                                     &s_motor_pm_lock));
+#endif
+  BaseType_t task_created = xTaskCreate(motor_worker_task, "motor_worker",
+                                         4096, NULL, 4, &s_motor_worker);
+  ESP_ERROR_CHECK(task_created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 
   if (!s_health_task_started) {
     BaseType_t health_task_created = xTaskCreate(
@@ -1234,6 +1407,7 @@ static void zb_check_battery_report(uint8_t param) {
   // reporting.
   ESP_LOGI(TAG, "Scheduling next battery check in %d minutes",
            BATTERY_REPORTING_INTERVAL / (60 * 1000));
+  esp_zb_scheduler_alarm_cancel(zb_check_battery_report, 0);
   esp_zb_scheduler_alarm(zb_check_battery_report, 0,
                          BATTERY_REPORTING_INTERVAL);
 

@@ -9,10 +9,14 @@ This directory contains files for integrating the ESP32H2 window covering device
 
 ## Quick Setup
 
-1. Copy `working_converter.js` to your Z2M `data/external_converters/` directory
+1. Update the blind firmware to command protocol v1, then copy `working_converter.js` to your Z2M `data/external_converters/` directory
 2. Restart Zigbee2MQTT
 3. Pair your ESP32H2 device
 4. Device should be recognized as "ESP32H2-WindowCovering"
+
+For existing devices, run **Reconfigure** after installing the firmware/converter.
+The converter now confirms each command result and reports an error if the
+firmware lacks protocol v1. See [reliability behavior, diagnostics and testing](../docs/command-reliability.md).
 
 ## Features
 

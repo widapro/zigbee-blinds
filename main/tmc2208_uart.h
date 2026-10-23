@@ -29,6 +29,7 @@ typedef struct {
 typedef struct {
   tmc2208_uart_config_t config;
   bool initialized;
+  uint8_t last_register;
 } tmc2208_uart_t;
 
 esp_err_t tmc2208_uart_init(tmc2208_uart_t *driver,

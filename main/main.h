@@ -15,6 +15,10 @@ extern uint8_t g_motor_speed;           // Motor speed (1-100, 50 is the default
 extern uint8_t g_tmc_mres_requested;    // Requested TMC2208 MRES value
 extern uint8_t g_tmc_mres_actual;       // Last verified TMC2208 MRES value
 extern uint8_t g_tmc_last_error;        // Last TMC2208 driver error code
+extern uint8_t g_tmc_uart_register;     // UART register at failed driver setup (255=none)
+extern uint32_t g_tmc_uart_error;       // esp_err_t from failed driver setup
+extern uint8_t g_motor_startup_attempts; // Attempts used by the latest move
+extern uint32_t g_motor_startup_recoveries; // Pre-pulse driver recoveries this boot
 extern uint8_t g_rmt_status;            // STEP RMT status code
 extern uint8_t g_rmt_fail_stage;        // Last STEP RMT failure stage
 extern uint32_t g_rmt_last_error;       // Last STEP RMT esp_err_t value
